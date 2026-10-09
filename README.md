@@ -1,7 +1,7 @@
 # NewsAgent
 
-每日 AI 新闻助手：agent loop、runtime、hooks、5 个基础工具，以及基于 Markdown 的长期记忆。
-代码结构参照 `D:\HarnessAgent` 的 Python 分层，后续可以在此基础上接入新闻采集、摘要、去重、每日调度与推送。
+每日 AI 新闻助手：agent loop、runtime、hooks、5 个基础工具、2 个 Tavily 新闻工具，以及基于 Markdown 的长期记忆。
+代码结构参照 `D:\HarnessAgent` 的 Python 分层。支持按请求搜索新闻和提取网页正文，由 Agent 决定工具调用顺序；历史简报、每日调度与推送尚未实现。
 
 ## 运行
 
@@ -61,11 +61,13 @@ agent/
     registry.py    工具定义、JSON Schema 校验、dispatch
     result.py      统一成功/失败结果
     basic.py       5 个基础工具
+    news.py        Tavily 搜索、正文提取、HTTP 和输出边界
   cli.py           单次请求与 REPL
   demo.py          离线工具流程
 tests/
   test_agent.py    闭环及失败路径测试
   test_memory.py   跨启动持久化、偏好更新、召回缓存、记忆保护与引导测试
+  test_news.py     新闻 API 参数、错误、截断、Hooks 与搜索/阅读闭环（离线）
 ```
 
 流程：`submit → UserPromptSubmit → 模型 → PreToolUse → 工具 → PostToolUse → tool_result → 模型 → Stop`。
@@ -85,6 +87,8 @@ loop 支持单轮多个工具调用，顺序执行并按调用 ID 回送结果�
 | `search_content` | `keyword`, `dir` | `case_sensitive=false`, `max_results=100`, `max_files=5000` | 递归字面量搜索，返回文件路径、行号、匹配行 |
 | `write_file` | `path`, `content` | `overwrite=true` | UTF-8 写入，创建父目录；返回字节数 |
 | `bash` | `command` | `timeout=30` 秒，最多 300 秒 | 返回 shell、退出码、stdout、stderr、超时与截断标记 |
+| `search_news` | `query` | `time_range="day"`, `domains=[]`, `limit=10` | 搜索近期新闻，返回标题、链接、域名、估计日期、相关分数、内容片段 |
+| `fetch_article` | `url` | `max_chars=12000`, `extract_depth="basic"` | 用 Tavily Extract 读取单篇网页，返回 Markdown 正文和截断信息 |
 
 文件路径相对工作区解析，拒绝通过 `..`、绝对路径、symlink / junction 访问外部。文本单文件默认限制 2 MB，二进制与非 UTF-8 文件不作为文本读取。搜索跳过 `.git`、`.venv`、`venv`、`node_modules`、`__pycache__`、`.agent` 子目录，且不遍历目录链接；显式指定 `.agent/demo` 为搜索根目录时仍可搜索。
 
@@ -93,6 +97,49 @@ loop 支持单轮多个工具调用，顺序执行并按调用 ID 回送结果�
 `write_file` 使用同目录临时文件与原子替换；`overwrite=false` 要求目标不存在。`bash` 自动优先使用 Bash，Windows 找不到时使用 PowerShell，POSIX 则使用 sh。`AGENT_SHELL` 可指定名称或可执行文件路径。Windows 隐藏 shell 窗口，超时尝试终止进程树。
 
 **bash 使用宿主权限，cwd 不构成沙箱。** 文件工具的路径限制不会限制 shell 命令；可设置 `AGENT_ALLOW_BASH=false`。
+
+## Tavily 新闻工具
+
+在项目 `.env` 中填写自己的 `TAVILY_API_KEY`，可配置 `TAVILY_TIMEOUT=30`（单次 socket 超时，最多 120 秒）。这个 Key 与模型的 `ANTHROPIC_API_KEY` 独立；没有 Tavily Key 不妨碍基础工具与手动资料管理，新闻工具会返回 `MISSING_API_KEY`。本实现使用 Python 标准库 `urllib` 直接请求官方 REST API，不需要额外安装 Tavily SDK。
+
+```dotenv
+TAVILY_API_KEY=填写自己的Key
+TAVILY_TIMEOUT=30
+```
+
+`search_news(query, time_range="day", domains=[], limit=10)` 固定向 `https://api.tavily.com/search` 发 POST 请求，使用 Bearer 认证、`topic="news"`、`search_depth="basic"`。`time_range` 支持 day/week/month/year，数量为 1..20；domains 最多 20 项，仅填写域名，例如 `example.com`，不填协议与路径。不限制域名时不发送 include_domains。关闭服务生成的 answer 和搜索时的全文获取，保留原始来源片段，由自己的 Agent 负责总结。新闻搜索主要面向新闻报道，并不保证覆盖全部官方博客或论文。
+
+启用 `include_published_date` 和 `filter_by_published_date`：按服务估计的发布或更新时间筛选，无法识别日期的来源会被排除。day 是服务向前的一天窗口，不等于 Asia/Shanghai 的自然日；日期可能是更新日期，生成“今日新闻”时应核对原文。没有结果是一次成功的空查询，不证明没有相关事件，可由 Agent 改关键词或时间范围。
+
+输出 results 中的每项包含 `title`、`url`、`source`（域名）、`published_date`、`score`、`snippet` 和 `snippet_truncated`。工具只去除重复 URL（移除 fragment 后比较），不做语义上的同事件聚类，也不自行计算用户相关性。Agent 使用注入的长期身份/偏好拟定查询词，再判断相关性和同事件重复报道。顶层有 `retrieved_at`（UTC）、`returned_count`、`duplicates_removed`、`skipped_results`、`results_omitted`、`truncated` 和可选值 `credits_used`（未返回时 null）。
+
+`fetch_article(url, max_chars=12000, extract_depth="basic")` 向固定 `/extract` API 发送单 URL，指定 Markdown 格式；不传 query，避免返回按关键词重排的少数片段。深度可选 basic/advanced，后者通常用于普通提取失败后的尝试，费用更高。只接受 HTTP(S) 公开地址，拒绝带凭据的 URL、已知内网 IP、本地主机名和非 80/443 端口；URL 通过 Tavily 服务提取，宿主不会直接抓取目标网页。域名校验不验证 DNS、网页重定向或第三方提取服务的网络边界。
+
+输出有 `url`、`source`、`content`、`format`、`extract_depth`、`original_chars`、`returned_chars`、`truncated`、`retrieved_at`、`credits_used`。正文可能被服务省略或提取失败；`truncated=false` 只表示本工具没有继续截短服务返回的正文，不保证它覆盖原网页全部内容。max_chars 范围 1..20000；最终序列化 JSON 也受 `AGENT_MAX_TOOL_OUTPUT` 约束。搜索先缩短片段，再省略尾部结果；正文通过二分搜索缩短文本，保持完整 JSON。极小输出预算返回 `OUTPUT_LIMIT`。
+
+工具总是注册在默认 Runtime 中，沿用参数校验、PreToolUse/PostToolUse 和 tool_result 回送；传入自定义 ToolRegistry 时仍由调用者选择工具。两者标记 read_only，因为不写本地文件，但真实 API 调用会消耗 Tavily 额度。HTTP 响应最多读取 5 MB，不自动重试；不跟随 API 重定向，防止转发认证头。错误不回显原始异常或服务响应正文。401/403 为 AUTH_ERROR，429 为 RATE_LIMITED，432/433 为 QUOTA_EXCEEDED；网络超时、无效响应、提取失败分别返回明确错误，交给 Agent 决定下一步。
+
+```python
+from agent import Runtime
+
+# create() 自动读取启动目录 .env。显式传入 Settings 时，应自己提供配置字段。
+with Runtime.create() as runtime:
+    news = runtime.call_tool("search_news", query="open source AI model release", time_range="week", limit=5)
+    print(news.content)
+    # 用搜索返回的真实链接调用正文工具：
+    # article = runtime.call_tool("fetch_article", url="...", max_chars=12000)
+    # print(article.content)
+```
+
+直接 call_tool 不需要主模型理解任务，所以配置 Tavily Key 后 mock 模式也能调用真实新闻 API。要让 Agent 自主搜索、阅读并生成简报，需要同时配置真实模型 provider、MODEL_ID 和模型 Key，然后运行：
+
+```powershell
+.\.venv\Scripts\python.exe -m agent "根据我的身份和偏好，整理近期 AI 新闻，并附来源链接" --verbose
+```
+
+提示词要求模型把新闻内容当作外部资料，不执行网页中的指令；区分搜索片段和正文、核对日期并给出来源。程序不强制固定“搜一次、读一次”的流程，也没有实现简报自动保存。
+
+官方参考：[Search](https://docs.tavily.com/documentation/api-reference/endpoint/search)、[Extract](https://docs.tavily.com/documentation/api-reference/endpoint/extract)、[额度与计费](https://docs.tavily.com/documentation/api-credits)。离线测试替换 HTTP 传输层，不消耗 API 额度；真实联调需有效凭据和可达网络。
 
 ## Runtime 与 Hooks
 

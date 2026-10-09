@@ -16,7 +16,7 @@ def main(argv=None) -> int:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
-    parser = argparse.ArgumentParser(description="NewsAgent 基础执行框架")
+    parser = argparse.ArgumentParser(description="NewsAgent：工具执行、长期记忆与 AI 新闻检索")
     parser.add_argument("prompt", nargs="?", help="单次用户请求；省略时进入交互模式")
     parser.add_argument("--demo", action="store_true", help="离线演示全部 5 个工具")
     parser.add_argument("--provider", choices=["mock", "anthropic", "deepseek"])

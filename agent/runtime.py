@@ -11,7 +11,7 @@ from .llm import LLMClient, MockLLM, build_client
 from .loop import LoopResult, execute_tool, run_loop
 from .memory import MemoryStore
 from .prompt import build_system_prompt
-from .tools import ToolContext, ToolRegistry, ToolResult, register_basic_tools
+from .tools import ToolContext, ToolRegistry, ToolResult, register_basic_tools, register_news_tools
 
 
 @dataclass
@@ -30,6 +30,7 @@ class Runtime:
         self.tools = tools if tools is not None else ToolRegistry()
         if tools is None:
             register_basic_tools(self.tools)
+            register_news_tools(self.tools)
         self.messages: list[dict] = []
         self.stats = RuntimeStats()
         self.ctx = ToolContext(settings, settings.workdir, runtime=self)

@@ -323,7 +323,9 @@ class AgentTest(unittest.TestCase):
             payload = sdk.return_value.messages.create.call_args.kwargs
             self.assertEqual(payload["model"], "test-model")
             self.assertEqual(payload["max_tokens"], 123)
-            self.assertEqual(len(payload["tools"]), 5)
+            self.assertEqual({tool["name"] for tool in payload["tools"]},
+                             {"list_dir", "read_file", "search_content", "write_file", "bash",
+                              "search_news", "fetch_article"})
             self.assertEqual(response.content[0]["signature"], "keep-me")
             self.assertEqual(response.usage["input_tokens"], 10)
             adapter.close()

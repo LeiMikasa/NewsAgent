@@ -8,6 +8,7 @@ import math
 import re
 import socket
 from datetime import datetime, timezone
+from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -20,22 +21,23 @@ API_BASE = "https://api.tavily.com"
 MAX_RESPONSE_BYTES = 5_000_000
 HOST_PATTERN = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", re.I)
 
-
+# 禁止重定向
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         # 不把包含 Bearer Key 的请求自动转发到其他地址。
         return None
 
-
+# 只允许公网主机，看是不是公网的
 def _public_host(host: str) -> bool:
     host = host.lower().rstrip(".")
     try:
         return ipaddress.ip_address(host).is_global
     except ValueError:
         return (len(host) <= 253 and HOST_PATTERN.fullmatch(host) is not None
+                and not host.replace(".", "").isdigit()
                 and not host.endswith((".localhost", ".local", ".internal", ".test", ".invalid")))
 
-
+# URL白名单校验
 def _article_url(value: str) -> str:
     """公开 HTTP(S) 地址；过滤凭据、内网 IP 和本地主机，移除 fragment。"""
     if not isinstance(value, str) or len(value) > 2048 or re.search(r"\s|[\x00-\x1f\x7f\\]", value):
@@ -45,13 +47,14 @@ def _article_url(value: str) -> str:
             or parts.username is not None or parts.password is not None
             or parts.port not in {None, 80, 443} or not _public_host(parts.hostname)):
         raise ValueError("url must be a public HTTP(S) URL without credentials, using port 80 or 443")
-    return urlunsplit((parts.scheme, parts.netloc.lower(), parts.path, parts.query, ""))
+    return urlunsplit((parts.scheme, parts.netloc.lower(), parts.path or "/", parts.query, ""))
 
-
+# 统一的API调用
 def _post_tavily(endpoint: str, payload: dict, ctx: ToolContext) -> dict | ToolResult:
-    key = ctx.settings.tavily_api_key
+    key = ctx.settings.tavily_api_key # 检查API key
     if not key:
         return ToolResult.failure("MISSING_API_KEY", "Set TAVILY_API_KEY in .env to use news tools.")
+    # 构造请求
     request = Request(f"{API_BASE}/{endpoint}",
                       data=json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8"),
                       headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
@@ -87,7 +90,7 @@ def _post_tavily(endpoint: str, payload: dict, ctx: ToolContext) -> dict | ToolR
         return ToolResult.failure(code, "Cannot reach Tavily; check network/proxy. No automatic retry.")
     except (UnicodeError, ValueError):
         return ToolResult.failure("INVALID_RESPONSE", "Tavily returned invalid JSON or UTF-8.")
-    except OSError:
+    except (OSError, HTTPException):
         return ToolResult.failure("NETWORK_ERROR", "Tavily connection failed; no automatic retry.")
 
 
@@ -174,7 +177,7 @@ def run_search_news(args: dict, ctx: ToolContext) -> ToolResult:
                         "results_omitted": omitted, "truncated": truncated or bool(omitted),
                         "credits_used": _credits(data)}, ctx.settings.max_tool_output)
 
-
+# 读取Agent选中的文章
 def run_fetch_article(args: dict, ctx: ToolContext) -> ToolResult:
     try:
         url = _article_url(args["url"])

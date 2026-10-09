@@ -27,6 +27,8 @@ class Settings:
     memory_enabled: bool = True
     memory_auto_extract: bool = True
     memory_dir: Path | None = None
+    tavily_api_key: str | None = field(default=None, repr=False)
+    tavily_timeout: float = 30
 
     def __post_init__(self) -> None:
         self.workdir = Path(self.workdir).expanduser().resolve()
@@ -48,6 +50,13 @@ class Settings:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.tavily_api_key is not None:
+            if not isinstance(self.tavily_api_key, str) or any(c in self.tavily_api_key for c in "\r\n"):
+                raise ValueError("tavily_api_key must be a single-line string")
+            self.tavily_api_key = self.tavily_api_key.strip()
+        if (isinstance(self.tavily_timeout, bool) or not isinstance(self.tavily_timeout, (int, float))
+                or not 0 < self.tavily_timeout <= 120):
+            raise ValueError("tavily_timeout must be between 0 and 120 seconds")
         for name in ("model_timeout", "bash_timeout"):
             value = getattr(self, name)
             if not 0 < value <= 3600:
@@ -76,6 +85,8 @@ def load_settings(env_file: str | Path | None = None, **overrides) -> Settings:
         "max_file_bytes": ("AGENT_MAX_FILE_BYTES", int),
         "shell": ("AGENT_SHELL", str),
         "memory_dir": ("AGENT_MEMORY_DIR", Path),
+        "tavily_api_key": ("TAVILY_API_KEY", str),
+        "tavily_timeout": ("TAVILY_TIMEOUT", float),
     }
     resolved = {}
     for field_name, (env_name, converter) in mapping.items():
