@@ -6,9 +6,10 @@ from dataclasses import dataclass
 from typing import Callable
 
 from .config import Settings, load_settings
-from .events import Hooks, SESSION_END, SESSION_START, USER_PROMPT_SUBMIT
-from .llm import LLMClient, build_client
+from .events import Hooks, SESSION_END, SESSION_START, STOP, USER_PROMPT_SUBMIT
+from .llm import LLMClient, MockLLM, build_client
 from .loop import LoopResult, execute_tool, run_loop
+from .memory import MemoryStore
 from .prompt import build_system_prompt
 from .tools import ToolContext, ToolRegistry, ToolResult, register_basic_tools
 
@@ -22,7 +23,8 @@ class RuntimeStats:
 
 class Runtime:
     def __init__(self, settings: Settings, llm: LLMClient, *, hooks: Hooks | None = None,
-                 tools: ToolRegistry | None = None, on_event: Callable[[str], None] | None = None):
+                 tools: ToolRegistry | None = None, on_event: Callable[[str], None] | None = None,
+                 memory_llm: LLMClient | None = None):
         self.settings, self.llm = settings, llm
         self.hooks = hooks if hooks is not None else Hooks()
         self.tools = tools if tools is not None else ToolRegistry()
@@ -32,6 +34,18 @@ class Runtime:
         self.stats = RuntimeStats()
         self.ctx = ToolContext(settings, settings.workdir, runtime=self)
         self.on_event = on_event
+        # Separate offline bookkeeping from the agent's scripted conversation.
+        # Live runtimes reuse the configured client unless explicitly overridden.
+        self.memory_llm = memory_llm if memory_llm is not None else (
+            MockLLM(responder=lambda index, messages, tools:
+                    "offline selection" if messages[0]["content"].startswith("Select memory records")
+                    else "[]") if settings.provider == "mock" else llm)
+        self.memory = MemoryStore(self.memory_llm, settings.model, settings.memory_dir,
+                                  settings.workdir, enabled=settings.memory_enabled)
+        self._memory_sections: list[str] | None = None
+        self._memory_pending = False
+        self.hooks.register(SESSION_START, self._memory_session_start)
+        self.hooks.register(STOP, self._memory_stop_hook)
         self._started = False
         self._closed = False
         self._busy = False
@@ -40,12 +54,75 @@ class Runtime:
     def create(cls, settings: Settings | None = None, *, llm: LLMClient | None = None,
                script: list | None = None, responder: Callable | None = None,
                env_file=None, hooks: Hooks | None = None, tools: ToolRegistry | None = None,
-               on_event: Callable[[str], None] | None = None, **overrides) -> "Runtime":
+               on_event: Callable[[str], None] | None = None,
+               memory_llm: LLMClient | None = None, **overrides) -> "Runtime":
         settings = settings if settings is not None else load_settings(env_file, **overrides)
         if llm is not None and (script is not None or responder is not None):
             raise ValueError("use either llm or script/responder")
         client = llm if llm is not None else build_client(settings, script=script, responder=responder)
-        return cls(settings, client, hooks=hooks, tools=tools, on_event=on_event)
+        return cls(settings, client, hooks=hooks, tools=tools, on_event=on_event, memory_llm=memory_llm)
+
+    def _memory_session_start(self, ctx: ToolContext) -> None:
+        if not self.memory.enabled:
+            return
+        try:
+            if not self.memory.read_index() and self.memory.list_records():
+                self.memory.rebuild_index()
+            ctx.extra["missing_profile_fields"] = self.memory.missing_profile_fields()
+        except Exception as exc:
+            self.memory._note(f"startup memory skipped: {type(exc).__name__}: {exc}")
+
+    def _memory_stop_hook(self, result: LoopResult, ctx: ToolContext) -> None:
+        # Stop may be vetoed by a later hook. Only extract after the request
+        # actually finishes, once, so continued/failed rounds cannot write memory.
+        if self.memory.enabled and self.settings.memory_auto_extract:
+            self._memory_pending = True
+
+    @property
+    def missing_profile_fields(self) -> list[str]:
+        return self.memory.missing_profile_fields()
+
+    def update_profile(self, *, identity: str | None = None, preferences: str | None = None) -> dict[str, str]:
+        if self._closed or self._busy:
+            raise RuntimeError("cannot update profile while runtime is closed or busy")
+        profile = self.memory.set_profile(identity=identity, preferences=preferences)
+        self._memory_sections = None
+        self.ctx.extra["missing_profile_fields"] = self.memory.missing_profile_fields()
+        self.ctx.extra.pop("profile_setup_skipped", None)
+        return profile
+
+    def build_system(self) -> str:
+        base = build_system_prompt(self.settings)
+        if not self.memory.enabled:
+            return base
+        if self._memory_sections is None:
+            try:
+                self._memory_sections = self.memory.system_sections(self.messages)
+            except Exception as exc:
+                self.memory._note(f"memory recall skipped: {type(exc).__name__}: {exc}")
+                self._memory_sections = []
+        sections = [base, *self._memory_sections]
+        missing = self.memory.missing_profile_fields()
+        if missing:
+            labels = {"identity": "职业/角色与背景", "preferences": "新闻关注主题与阅读偏好"}
+            instruction = ("本次会话已跳过资料设置，请使用已有信息或通用简报，不重复追问。"
+                           if self.ctx.extra.get("profile_setup_skipped") else
+                           "生成个性化新闻简报前请了解缺少的资料；用户可明确跳过。其他任务正常处理。")
+            sections.append("尚未设置用户长期资料：" + "、".join(labels[field] for field in missing) + "。" + instruction)
+        sections.append("长期身份与新闻偏好通过记忆模块保存。用户说‘今天/这次’时只影响当前任务；"
+                        "说‘以后/长期’或明确更正身份时才更新长期记录。不要用文件工具自行改写记忆索引。")
+        if not self.settings.memory_auto_extract:
+            sections.append("本次运行关闭了自动记忆提取。长期资料变更请提示用户使用 /profile edit；"
+                            "不要声称已自动保存对话里的新偏好。")
+        return "\n\n".join(sections)
+
+    def _finish_memory(self, messages: list[dict]) -> None:
+        try:
+            if self.memory.extract(messages):
+                self.memory.consolidate()
+                self.ctx.extra["missing_profile_fields"] = self.memory.missing_profile_fields()
+        except Exception as exc:
+            self.memory._note(f"memory extraction skipped: {type(exc).__name__}: {exc}")
 
     def _start(self) -> None:
         if self._closed:
@@ -66,12 +143,18 @@ class Runtime:
             blocked = self.hooks.trigger(USER_PROMPT_SUBMIT, prompt, self.ctx)
             if blocked is not None:
                 return LoopResult(stop_reason="blocked", error=str(blocked))
+            request_start = len(self.messages)
+            self._memory_sections = None
+            self._memory_pending = False
             self.messages.append({"role": "user", "content": prompt})
             result = run_loop(llm=self.llm, registry=self.tools, messages=self.messages,
-                              system=lambda: build_system_prompt(self.settings), ctx=self.ctx,
+                              system=self.build_system, ctx=self.ctx,
                               hooks=self.hooks, max_turns=self.settings.max_turns, on_event=self.on_event)
             self.stats.turns += result.turns
             self.stats.tool_calls += result.tool_calls
+            if result.ok and self._memory_pending:
+                self._finish_memory(self.messages[request_start:])
+                self._memory_sections = None
             return result
         except Exception as exc:
             return LoopResult(stop_reason="error", error=f"{type(exc).__name__}: {exc}")
@@ -96,6 +179,8 @@ class Runtime:
             raise RuntimeError("cannot reset an active request")
         self.messages.clear()
         self.ctx.extra.clear()
+        self._memory_sections = None
+        self._memory_pending = False
 
     def close(self) -> None:
         if self._closed:
@@ -107,9 +192,15 @@ class Runtime:
             if self._started:
                 self.hooks.collect(SESSION_END, self.ctx)
         finally:
-            close_client = getattr(self.llm, "close", None)
-            if callable(close_client):
-                close_client()
+            try:
+                close_client = getattr(self.llm, "close", None)
+                if callable(close_client):
+                    close_client()
+            finally:
+                if self.memory_llm is not self.llm:
+                    close_memory = getattr(self.memory_llm, "close", None)
+                    if callable(close_memory):
+                        close_memory()
 
     def __enter__(self) -> "Runtime":
         return self

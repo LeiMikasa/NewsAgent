@@ -9,6 +9,15 @@ from typing import Any, Callable, Protocol
 from .config import Settings
 
 
+def extract_text(content: Any) -> str:
+    """兼容 HarnessAgent memory：只取文字，不把工具结果当用户事实。"""
+    if isinstance(content, str):
+        return content
+    return "\n".join(block["text"] for block in content or []
+                     if isinstance(block, dict) and block.get("type") == "text"
+                     and isinstance(block.get("text"), str) and block["text"])
+
+
 @dataclass
 class LLMResponse:
     content: list[dict] = field(default_factory=list)
@@ -16,8 +25,7 @@ class LLMResponse:
     usage: dict | None = None
 
     def text(self) -> str:
-        return "\n".join(block["text"] for block in self.content
-                         if block.get("type") == "text" and block.get("text"))
+        return extract_text(self.content)
 
 
 class LLMClient(Protocol):

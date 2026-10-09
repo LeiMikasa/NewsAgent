@@ -1,6 +1,6 @@
 # NewsAgent
 
-每日 AI 新闻助手的第一阶段：搭建 agent loop、runtime、hooks 和 5 个基础工具。
+每日 AI 新闻助手：agent loop、runtime、hooks、5 个基础工具，以及基于 Markdown 的长期记忆。
 代码结构参照 `D:\HarnessAgent` 的 Python 分层，后续可以在此基础上接入新闻采集、摘要、去重、每日调度与推送。
 
 ## 运行
@@ -27,11 +27,11 @@ demo 使用离线脚本驱动实际的 loop：写入 `.agent/demo/news.txt`，�
 ```powershell
 # 单次请求，结构化输出
 .\.venv\Scripts\python.exe -m agent "检查当前目录" --json
-# 交互模式；/reset 清空对话，/exit 退出
+# 交互模式；首次询问身份与订阅偏好，/reset 清空对话，/exit 退出
 .\.venv\Scripts\python.exe -m agent
 ```
 
-其他参数：`--workdir` 指定工作区，`--env-file` 指定配置文件，`--max-turns` 限制模型轮数，`--no-bash` 禁用 shell，`--verbose` 输出进度。
+其他参数：`--workdir` 指定工作区，`--env-file` 指定配置文件，`--max-turns` 限制模型轮数，`--no-bash` 禁用 shell，`--verbose` 输出进度及记忆诊断。
 
 ## 接入真实模型
 
@@ -53,6 +53,8 @@ agent/
   llm.py           统一 LLMClient、Anthropic 兼容客户端、MockLLM
   loop.py          run_loop、execute_tool、LoopResult
   runtime.py       组件组装、会话消息、统计、生命周期
+  memory.py        从 HarnessAgent 复用的长期记忆：保存、召回、提取、整理
+  onboarding.py    首次身份与偏好引导、资料查看与编辑
   events.py        Hooks、StopDirective
   prompt.py        系统提示词
   tools/
@@ -63,6 +65,7 @@ agent/
   demo.py          离线工具流程
 tests/
   test_agent.py    闭环及失败路径测试
+  test_memory.py   跨启动持久化、偏好更新、召回缓存、记忆保护与引导测试
 ```
 
 流程：`submit → UserPromptSubmit → 模型 → PreToolUse → 工具 → PostToolUse → tool_result → 模型 → Stop`。
@@ -125,7 +128,53 @@ Stop hook 返回 `StopDirective("continue", "请再检查文件内容")` 可以�
 
 PreToolUse hook 异常会阻止执行。PostToolUse 异常保留实际工具结果、继续通知其他观察者，并记录在 `runtime.ctx.extra["hook_errors"]`。
 
-`runtime.messages` 在内存中保存会话，`runtime.stats` 汇总请求数、模型轮数和工具调用次数。各 runtime 的 hooks 与状态相互独立；同一实例采用同步调用并阻止请求重入。本阶段未加入会话落盘、长期记忆、上下文压缩和调度器。
+`runtime.messages` 在内存中保存会话，`runtime.stats` 汇总用户请求的模型轮数和工具调用次数，不包含额外的记忆模型调用。各 runtime 的 hooks 与对话状态相互独立；同一实例采用同步调用并阻止请求重入。同一工作区的 Runtime 会读取相同的持久记忆目录，当前面向单用户使用。本阶段未加入对话记录落盘、上下文压缩和调度器。
+
+## 长期记忆
+
+实现复用自 `D:\HarnessAgent\agent\memory.py`，保留 Markdown 文件、索引、相关记忆选择、对话提取与整理机制。只复用代码，NewsAgent 的记忆保存在自己的工作区。
+
+首次在交互终端启动时会询问职业/角色/背景，以及新闻关注主题、来源、语言、深度和长度。直接保存用户输入，不依赖模型生成，因此 mock 模式也可以建立资料。输入 `/skip` 可跳过本次设置，空白会重新询问。
+
+```text
+.agent/memory/
+  MEMORY.md             生成的记忆索引
+  user-profile.md       身份与背景（固定加载）
+  news-preferences.md    新闻订阅偏好（固定加载）
+  <其他记忆>.md          相关时召回的稳定信息
+```
+
+资料完整后，下次启动不重复询问；只缺一项时仅补问该项。已跳过的当前会话不会被提示反复询问。首次引导只在普通交互终端运行，`--json`、非交互请求与 `--demo` 不调用 input；demo 关闭记忆，不创建用户资料。
+
+```powershell
+# 只建立或修改资料，完成后退出
+.\.venv\Scripts\python.exe -m agent --setup-profile
+# 保留资料加载与手动编辑，关闭对话结束后的自动提取
+.\.venv\Scripts\python.exe -m agent --no-auto-memory
+# 完全关闭记忆和引导
+.\.venv\Scripts\python.exe -m agent --no-memory
+```
+
+交互命令：`/profile` 查看身份与偏好；`/profile edit` 修改，已有字段留空时保留；`/memory` 查看记忆索引；`/reset` 清空当前对话，保留磁盘记忆。
+
+Runtime 持有 `memory`，并使用 `build_system()` 组装基础提示词、固定身份/偏好和按请求选择的其他记忆。普通记忆每次用户请求只选择一次，工具循环复用缓存；下一次请求重新选择。核心资料不依赖模型选择，始终加载。
+
+Stop hook 标记提取意图，Runtime 在请求实际以 `final` 结束后提取一次，避免 Stop 续跑时重复提取；失败、拒绝、轮数耗尽时不自动保存。提取只检查本次请求的对话，要求模型提供用户原文证据，并仅接收 `persistent` 信息。助手推测、工具结果与当前任务状态不作为长期事实。
+
+用户明确变更身份或长期偏好时，更新对应固定记录，并要求模型保留未更改的内容。`今天只看…`、`这次…` 等临时要求不会覆盖长期资料。核心记录不参与自动整理，不会被记忆合并和裁剪。一般记忆达到 10 条时整理，核心两条不计入阈值。
+
+每个 Markdown 文件采用临时文件加原子替换；整理失败时尝试恢复原始一般记忆。模型错误或不完整的记忆响应不会使正常对话失败，使用 `--verbose` 查看诊断，`/profile` 检查实际保存内容。
+
+默认 mock 不理解任意自然语言，也不自动提取新记忆：它能保存/加载手动资料，并对一般记忆用关键词作召回后备。真实模型用于自动提取和偏好更正；离线测试通过独立 `memory_llm` 脚本验证这些行为，不消耗主 Agent 的 mock 脚本。
+
+配置：`AGENT_MEMORY_ENABLED=true`，`AGENT_MEMORY_AUTO_EXTRACT=true`，`AGENT_MEMORY_DIR=.agent/memory`（默认，路径必须在工作区子目录）。默认目录已由 `.gitignore` 排除；使用其他目录时，应将该目录加入忽略规则。
+
+```python
+with Runtime.create(Settings(workdir=Path("D:/NewsAgent"))) as runtime:
+    runtime.update_profile(identity="AI 产品经理", preferences="开源与应用，中文，每天五条")
+    print(runtime.memory.profile())
+    result = runtime.submit("请按我的偏好处理这次任务")
+```
 
 ## 扩展工具
 
