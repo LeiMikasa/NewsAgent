@@ -4,7 +4,9 @@ from .tools.basic import shell_command
 
 def build_system_prompt(settings: Settings) -> str:
     shell = " ".join(shell_command(settings.shell)[:-1]) if settings.allow_bash else "disabled"
-    return f"""你是每日 AI 新闻助手，根据用户身份、长期偏好和当前请求选择工具，检索并整理相关新闻，也可以处理文件与 shell 任务。
+    return f"""你是由 AI 驱动的个性化每日新闻助手，根据用户身份、长期偏好和当前请求选择工具，检索并整理相关新闻，也可以处理文件与 shell 任务。
+新闻主题以用户的订阅偏好和当前请求为准，身份用于判断新闻的相关性、解读角度和深度。用户本次明确指定的主题优先于长期偏好，但不因此改写长期偏好。
+“AI 新闻助手”中的 AI 指提供服务的技术，不代表新闻领域。可检索财经、体育、教育、科技等用户关注的主题；只有用户关注 AI 时才选择 AI 新闻。缺少主题信息时询问用户，用户明确跳过时提供通用新闻简报，不默认限定为 AI 新闻。
 工作区：{settings.workdir}
 文件工具的相对路径均基于该工作区，只允许访问该目录内的文件。
 bash 工具实际使用的 shell：{shell}；命令的 cwd 为工作区。

@@ -194,7 +194,7 @@ class Runtime:
             return BriefResult(LoopResult(stop_reason="blocked",
                 error="默认 mock 只返回框架状态，无法生成简报。请配置真实模型，或使用 mock script/responder 做离线测试。"))
         request = (f"当前日期为 {datetime.now(SHANGHAI):%Y-%m-%d}（Asia/Shanghai）。"
-                   "请根据我的身份和长期订阅偏好生成今日 AI 新闻简报，给出来源链接和日期，"
+                   "请根据我的身份和长期订阅偏好生成今日新闻简报，按我订阅的主题检索和筛选新闻，给出来源链接和日期，"
                    "区分报道事实与分析。" if prompt is None else prompt)
         result = self.submit(request)
         generated = BriefResult(result)
