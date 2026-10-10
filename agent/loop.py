@@ -14,6 +14,16 @@ from .tools.result import ToolResult
 from .tools.recovery import ToolRecovery
 
 
+# 与 HarnessAgent 一致：连续不完整响应最多额外请求两次；仍受 max_turns 限制。
+MAX_INCOMPLETE_RETRIES = 2
+FULL_ANSWER_INSTRUCTION = (
+    "Your response was cut off. Use the draft and earlier tool results to finish the task. "
+    "Return one complete, self-contained answer from the beginning, including all necessary "
+    "sections and source links; do not return only the remaining tail. Keep it concise enough "
+    "to fit the output limit. Do not repeat completed tool calls or invent missing facts."
+)
+
+
 @dataclass
 class LoopResult:
     text: str = ""
@@ -112,35 +122,77 @@ def run_loop(*, llm: LLMClient, registry: ToolRegistry, messages: list[dict],
     ctx.extra["tool_attempts"] = recovery.events
     initial_executions = recovery.executions
     result = LoopResult()
+    incomplete_retries = 0
+    recovery_note = ""
     for turn in range(1, max_turns + 1):
         result.turns = turn
         try:
             if on_event:
                 on_event(f"[model] round {turn}")
+            system_prompt = system() if callable(system) else system
+            if recovery_note:
+                system_prompt += "\n\n" + recovery_note
             response = normalize_response(llm.create(
-                system=system() if callable(system) else system,
+                system=system_prompt,
                 messages=copy.deepcopy(messages), tools=registry.definitions(),
                 max_tokens=ctx.settings.max_tokens))
             calls = [block for block in response.content if block.get("type") == "tool_use"]
-            ids = [block.get("id") for block in calls]
-            if any(not isinstance(value, str) or not value for value in ids) or len(ids) != len(set(ids)):
-                raise ValueError("tool_use ids must be nonempty and unique within a response")
-            # 截断的响应可能包含不完整指令，不执行其中的任何工具。
-            if response.stop_reason in {"max_tokens", "pause_turn"}:
-                result.text = response.text()
+            final_text = response.text()
+            # 拒绝和 pause_turn 不属于这次迁移的恢复策略，也不执行其中的工具。
+            if response.stop_reason == "refusal":
+                result.text = final_text
+                result.stop_reason = "blocked"
+                return result
+            if response.stop_reason == "pause_turn":
+                result.text = final_text
                 result.stop_reason = "incomplete"
                 result.error = f"model response was incomplete: {response.stop_reason}"
                 return result
+            truncated = response.stop_reason == "max_tokens"
+            if truncated or (not calls and not final_text.strip()):
+                detail = "max_tokens" if truncated else "no answer text or tool calls"
+                if incomplete_retries >= MAX_INCOMPLETE_RETRIES:
+                    result.text = final_text if not calls else ""
+                    result.stop_reason = "incomplete"
+                    result.error = (f"model response was incomplete: {detail}; automatic recovery exhausted "
+                                    f"after {MAX_INCOMPLETE_RETRIES} retries. "
+                                    "Increase AGENT_MAX_TOKENS or request smaller steps if max_tokens is reported.")
+                    return result
+                incomplete_retries += 1
+                if calls:
+                    # 即使部分调用看似完整或 ID 无效，也丢弃整个截断批次，不留悬空 tool_use。
+                    recovery_note = (
+                        "[agent recovery] The previous response reached max_tokens while generating tool calls. "
+                        "None of that response's tool calls were executed; earlier completed tool results remain valid. "
+                        "Regenerate the next step as ONE small, complete tool call. Keep reasoning short, "
+                        "split large writes into smaller steps, and do not assume discarded calls succeeded. "
+                        "The eventual final answer must be complete and self-contained."
+                    )
+                else:
+                    recovery_note = (
+                        "[agent recovery] The previous response was incomplete. Continue the user's task "
+                        "with a concrete tool call or a concise, complete answer. Keep reasoning and each "
+                        "step short; do not claim completion without evidence."
+                    )
+                    if truncated and final_text.strip():
+                        # 保留纯文本草稿供重写；截断的 thinking/signature 不发回服务端。
+                        messages.append({"role": "assistant", "content": [{"type": "text", "text": final_text}]})
+                        messages.append({"role": "user", "content": FULL_ANSWER_INSTRUCTION})
+                        recovery_note += " " + FULL_ANSWER_INSTRUCTION
+                    # 空响应、只有思考块的响应不追加到历史，也不触发 Stop。
+                if on_event:
+                    try:
+                        on_event(f"[model recovery] {detail}; retry {incomplete_retries}/{MAX_INCOMPLETE_RETRIES}")
+                    except Exception as exc:
+                        ctx.extra.setdefault("hook_errors", []).append(f"on_event: {exc}")
+                continue
+            ids = [block.get("id") for block in calls]
+            if any(not isinstance(value, str) or not value for value in ids) or len(ids) != len(set(ids)):
+                raise ValueError("tool_use ids must be nonempty and unique within a response")
             if response.stop_reason == "tool_use" and not calls:
                 raise ValueError("tool_use stop_reason without tool_use blocks")
-            if response.stop_reason == "refusal":
-                result.text = response.text()
-                result.stop_reason = "blocked"
-                return result
-            if not response.content:
-                raise ValueError("model returned empty content")
-            if not calls and not response.text().strip():
-                raise ValueError("model returned no final text or tool calls")
+            incomplete_retries = 0
+            recovery_note = ""
             messages.append({"role": "assistant", "content": response.content})
             if calls:
                 outputs = []
@@ -159,7 +211,7 @@ def run_loop(*, llm: LLMClient, registry: ToolRegistry, messages: list[dict],
                 # 一轮中的多个工具结果统一追加，并与每个调用 id 配对。
                 messages.append({"role": "user", "content": outputs})
                 continue
-            result.text = response.text()
+            result.text = final_text
             directive = hooks.trigger(STOP, result, ctx)
             if directive is None:
                 return result

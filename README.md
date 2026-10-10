@@ -71,13 +71,26 @@ tests/
   test_memory.py   跨启动持久化、偏好更新、召回缓存、记忆保护与引导测试
   test_news.py     新闻 API 参数、错误、截断、Hooks 与搜索/阅读闭环（离线）
   test_tool_recovery.py  故障注入、次数边界、目标归一化、状态检查与日志上限
+  test_incomplete_response.py  空响应恢复、正文重写、截断工具保护与保存边界
 ```
 
 流程：`submit → UserPromptSubmit → 模型 → PreToolUse → 工具 → PostToolUse → tool_result → 模型 → Stop`。
 
 loop 支持单轮多个工具调用，顺序执行并按调用 ID 回送结果。每轮重新读取工具定义，新增工具无需修改 loop。`LoopResult` 包含 `text`、`turns`、`tool_calls`、`tool_attempts`、`stop_reason` 和 `error`；tool_calls 统计提出的工具调用，tool_attempts 统计 handler 实际执行（包括内部重试），参数/策略拦截不计执行。只有 `stop_reason=final` 时 `ok=True`，不代表所有工具成功或业务任务完成。
 
-工具错误回送模型用于修正或解释；有副作用的工具不自动重试。模型失败返回 `error`，轮数耗尽返回 `max_turns`，响应截断返回 `incomplete`。收到 `max_tokens` / `pause_turn` 时不会执行响应中的工具。
+工具错误回送模型用于修正或解释；有副作用的工具不自动重试。模型请求异常返回 `error`，轮数耗尽返回 `max_turns`。收到 `max_tokens` / `pause_turn` 时不会执行响应中的工具。
+
+### 模型不完整响应恢复
+
+沿用 HarnessAgent 的小额恢复预算：空响应、只有思考/空白文本的响应、`max_tokens` 截断共用最多 **2 次额外模型请求**。例如连续 3 次空响应后返回 `incomplete`；有效响应（包括完整工具调用）会重置连续计数。恢复请求也计入 `turns` 和 `max_turns`，每次新用户请求独立计数。这与工具内部重试、模型修正工具参数的预算分别计算。
+
+- 空响应与只有思考块的响应丢弃，不放入对话历史、不触发 Stop。
+- 正文截断时保留纯文本草稿，要求模型依据草稿和已有工具结果从头重写一份完整、精简的正文，包含必要章节与来源链接。最终只保存这份有效回复，不拼接草稿和尾段；截断的思考块不发回服务端。
+- 工具调用截断时整批丢弃，即使其中一个调用看似完整也不会执行。要求模型重新生成一个小而完整的调用，之前已完成的工具结果保留，不重放历史调用。
+
+`refusal` 直接返回 `blocked`；`pause_turn` 保持返回 `incomplete`，均不自动恢复。恢复耗尽、模型请求错误或轮数耗尽时，不进行自动记忆提取与简报归档。`--verbose` 可查看 `[model recovery]` 进度。
+
+此机制处理服务端报告的截断及空内容，不评估非空回复是否真正完成新闻任务；本次没有引入目标评估模型。
 
 ## 工具签名
 

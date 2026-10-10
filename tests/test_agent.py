@@ -217,7 +217,7 @@ class AgentTest(unittest.TestCase):
     def test_incomplete_response_has_no_tool_side_effects(self):
         response = LLMResponse([{"type": "tool_use", "id": "partial", "name": "write_file",
                                  "input": {"path": "bad.txt", "content": "partial"}}], "max_tokens")
-        with Runtime.create(self.settings, script=[response]) as runtime:
+        with Runtime.create(self.settings, script=[response] * 3) as runtime:
             self.assertEqual(runtime.submit("test").stop_reason, "incomplete")
             self.assertFalse((self.root / "bad.txt").exists())
             self.assertEqual(len(runtime.messages), 1)
