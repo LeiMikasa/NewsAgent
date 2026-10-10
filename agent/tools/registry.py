@@ -35,6 +35,7 @@ class Tool:
     input_schema: dict
     handler: Callable[[dict, ToolContext], ToolResult]
     read_only: bool = False
+    retry_safe: bool = False  # 由宿主显式允许；只读标记本身不启用重试。
 
     def definition(self) -> dict:
         return {"name": self.name, "description": self.description,
@@ -72,21 +73,23 @@ class ToolRegistry:
     def validate(self, name: Any, args: Any) -> ToolResult | None:
         # 先校验工具名称是否存在
         if not isinstance(name, str) or name not in self._tools:
-            return ToolResult.failure("UNKNOWN_TOOL", f"unknown tool {name!r}; available: {self.names()}")
+            return ToolResult.failure("UNKNOWN_TOOL", f"unknown tool {name!r}; available: {self.names()}",
+                                      field="name", action="correct_arguments")
         # 检查参数必须是字典
         if not isinstance(args, dict):
-            return ToolResult.failure("INVALID_ARGUMENT", "tool input must be a JSON object")
+            return ToolResult.failure("INVALID_ARGUMENT", "tool input must be a JSON object", action="correct_arguments")
         # 第三层按照 Schema 检查具体字段
         try:
             json.dumps(args, allow_nan=False)
             error = next(self._validators[name].iter_errors(args), None)
         except (ValueError, TypeError) as exc:
-            return ToolResult.failure("INVALID_ARGUMENT", str(exc))
+            return ToolResult.failure("INVALID_ARGUMENT", str(exc), action="correct_arguments")
         except Exception as exc:
             return ToolResult.failure("INVALID_SCHEMA", str(exc))
         if error is not None:
             field_name = ".".join(str(part) for part in error.path) or "input"
-            return ToolResult.failure("INVALID_ARGUMENT", f"{field_name}: {error.message}")
+            return ToolResult.failure("INVALID_ARGUMENT", f"{field_name}: {error.message}",
+                                      field=field_name, action="correct_arguments")
         return None
 
     def dispatch(self, name: str, args: dict, ctx: ToolContext) -> ToolResult:
@@ -94,15 +97,7 @@ class ToolRegistry:
         if invalid is not None:
             return invalid
         try:
-            value = self._tools[name].handler(args, ctx)
+            value = self._tools[name].handler(copy.deepcopy(args), ctx)
             return value if isinstance(value, ToolResult) else ToolResult.success(value)
-        except PermissionError as exc:
-            return ToolResult.failure("PERMISSION_DENIED", str(exc))
-        except FileNotFoundError as exc:
-            return ToolResult.failure("NOT_FOUND", str(exc))
-        except UnicodeError as exc:
-            return ToolResult.failure("NOT_TEXT", str(exc))
-        except (IsADirectoryError, NotADirectoryError) as exc:
-            return ToolResult.failure("PRECONDITION_FAILED", str(exc))
         except Exception as exc:
-            return ToolResult.failure("TOOL_ERROR", f"{type(exc).__name__}: {exc}")
+            return ToolResult.from_exception(exc, read_only=self._tools[name].read_only)

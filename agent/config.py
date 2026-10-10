@@ -29,6 +29,8 @@ class Settings:
     memory_dir: Path | None = None
     tavily_api_key: str | None = field(default=None, repr=False)
     tavily_timeout: float = 30
+    max_tool_retries: int = 2
+    max_tool_repairs: int = 2
 
     def __post_init__(self) -> None:
         self.workdir = Path(self.workdir).expanduser().resolve()
@@ -46,6 +48,10 @@ class Settings:
         for name in ("memory_enabled", "memory_auto_extract"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a boolean")
+        for name, maximum in (("max_tool_retries", 5), ("max_tool_repairs", 10)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+                raise ValueError(f"{name} must be an integer between 0 and {maximum}")
         for name in ("max_turns", "max_tokens", "max_tool_output", "max_file_bytes"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -87,6 +93,8 @@ def load_settings(env_file: str | Path | None = None, **overrides) -> Settings:
         "memory_dir": ("AGENT_MEMORY_DIR", Path),
         "tavily_api_key": ("TAVILY_API_KEY", str),
         "tavily_timeout": ("TAVILY_TIMEOUT", float),
+        "max_tool_retries": ("AGENT_MAX_TOOL_RETRIES", int),
+        "max_tool_repairs": ("AGENT_MAX_TOOL_REPAIRS", int),
     }
     resolved = {}
     for field_name, (env_name, converter) in mapping.items():

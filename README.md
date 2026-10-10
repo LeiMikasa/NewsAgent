@@ -60,6 +60,7 @@ agent/
   tools/
     registry.py    工具定义、JSON Schema 校验、dispatch
     result.py      统一成功/失败结果
+    recovery.py    HarnessAgent 两层预算：程序重试、模型修正与写入状态保护
     basic.py       5 个基础工具
     news.py        Tavily 搜索、正文提取、HTTP 和输出边界
   cli.py           单次请求与 REPL
@@ -68,11 +69,12 @@ tests/
   test_agent.py    闭环及失败路径测试
   test_memory.py   跨启动持久化、偏好更新、召回缓存、记忆保护与引导测试
   test_news.py     新闻 API 参数、错误、截断、Hooks 与搜索/阅读闭环（离线）
+  test_tool_recovery.py  故障注入、次数边界、目标归一化、状态检查与日志上限
 ```
 
 流程：`submit → UserPromptSubmit → 模型 → PreToolUse → 工具 → PostToolUse → tool_result → 模型 → Stop`。
 
-loop 支持单轮多个工具调用，顺序执行并按调用 ID 回送结果。每轮重新读取工具定义，新增工具无需修改 loop。`LoopResult` 包含 `text`、`turns`、`tool_calls`、`stop_reason` 和 `error`；只有 `stop_reason=final` 时 `ok=True`。
+loop 支持单轮多个工具调用，顺序执行并按调用 ID 回送结果。每轮重新读取工具定义，新增工具无需修改 loop。`LoopResult` 包含 `text`、`turns`、`tool_calls`、`tool_attempts`、`stop_reason` 和 `error`；tool_calls 统计提出的工具调用，tool_attempts 统计 handler 实际执行（包括内部重试），参数/策略拦截不计执行。只有 `stop_reason=final` 时 `ok=True`，不代表所有工具成功或业务任务完成。
 
 工具错误回送模型用于修正或解释；有副作用的工具不自动重试。模型失败返回 `error`，轮数耗尽返回 `max_turns`，响应截断返回 `incomplete`。收到 `max_tokens` / `pause_turn` 时不会执行响应中的工具。
 
@@ -117,7 +119,7 @@ TAVILY_TIMEOUT=30
 
 输出有 `url`、`source`、`content`、`format`、`extract_depth`、`original_chars`、`returned_chars`、`truncated`、`retrieved_at`、`credits_used`。正文可能被服务省略或提取失败；`truncated=false` 只表示本工具没有继续截短服务返回的正文，不保证它覆盖原网页全部内容。max_chars 范围 1..20000；最终序列化 JSON 也受 `AGENT_MAX_TOOL_OUTPUT` 约束。搜索先缩短片段，再省略尾部结果；正文通过二分搜索缩短文本，保持完整 JSON。极小输出预算返回 `OUTPUT_LIMIT`。
 
-工具总是注册在默认 Runtime 中，沿用参数校验、PreToolUse/PostToolUse 和 tool_result 回送；传入自定义 ToolRegistry 时仍由调用者选择工具。两者标记 read_only，因为不写本地文件，但真实 API 调用会消耗 Tavily 额度。HTTP 响应最多读取 5 MB，不自动重试；不跟随 API 重定向，防止转发认证头。错误不回显原始异常或服务响应正文。401/403 为 AUTH_ERROR，429 为 RATE_LIMITED，432/433 为 QUOTA_EXCEEDED；网络超时、无效响应、提取失败分别返回明确错误，交给 Agent 决定下一步。
+工具总是注册在默认 Runtime 中，沿用参数校验、PreToolUse/PostToolUse 和 tool_result 回送；传入自定义 ToolRegistry 时仍由调用者选择工具。两者标记 read_only 和 retry_safe，因为不写本地文件，但真实 API 调用会消耗 Tavily 额度。HTTP 响应最多读取 5 MB；请求函数只执行一次，Runtime 的恢复层对已标记的临时故障有限重试。默认首次调用后最多重试两次，设置 `AGENT_MAX_TOOL_RETRIES=0` 可关闭。每次 socket 超时分别受 TAVILY_TIMEOUT 控制，多次尝试的总时间可能更长。不跟随 API 重定向，防止转发认证头；错误不回显原始异常或服务响应正文。401/403 为 AUTH_ERROR，429 为 RATE_LIMITED，432/433 为 QUOTA_EXCEEDED；认证/额度错误不自动重试。短暂连接故障、408/425/429/500/502/503/504 可重试，证书错误及无法明确识别为临时故障的网络错误保守返回。Retry-After 支持秒数和 HTTP 日期；超过 30 秒等待上限时直接返回错误，不提前重试。
 
 ```python
 from agent import Runtime
@@ -175,7 +177,28 @@ Stop hook 返回 `StopDirective("continue", "请再检查文件内容")` 可以�
 
 PreToolUse hook 异常会阻止执行。PostToolUse 异常保留实际工具结果、继续通知其他观察者，并记录在 `runtime.ctx.extra["hook_errors"]`。
 
-`runtime.messages` 在内存中保存会话，`runtime.stats` 汇总用户请求的模型轮数和工具调用次数，不包含额外的记忆模型调用。各 runtime 的 hooks 与对话状态相互独立；同一实例采用同步调用并阻止请求重入。同一工作区的 Runtime 会读取相同的持久记忆目录，当前面向单用户使用。本阶段未加入对话记录落盘、上下文压缩和调度器。
+`runtime.messages` 在内存中保存会话，`runtime.stats` 汇总用户请求的模型轮数、工具调用次数和实际执行次数，不包含额外的记忆模型调用。各 runtime 的 hooks 与对话状态相互独立；同一实例采用同步调用并阻止请求重入。同一工作区的 Runtime 会读取相同的持久记忆目录，当前面向单用户使用。本阶段未加入对话记录落盘、上下文压缩和调度器。
+
+## 工具失败恢复
+
+从 HarnessAgent 适配 ToolRecovery，保留两层独立预算。程序重试要求 `read_only=True`、`retry_safe=True`、失败标记 `transient=True`，同时排除权限、认证、参数等永久错误。默认首次执行后最多重试两次，每次重新经过 PreToolUse，PostToolUse 观察每次尝试。文件写入与 bash 不自动重试。只读标记与 retry_safe 是宿主元数据，不是模型可传参数。list_dir/read_file/search_content 和两个新闻工具明确允许安全重试，其他自定义工具默认不允许。
+
+模型修正计数只观察一次工具调用的最终结果，首次失败后默认最多两次修正机会：同一工具/目标累计三次指定错误后，第四次被 `RECOVERY_EXHAUSTED` 拦截。成功清零。保留原来的 INVALID_ARGUMENT/UNKNOWN_TOOL/NOT_FOUND/PRECONDITION_FAILED，并为新闻加入 INVALID_REQUEST/EXTRACTION_FAILED/EMPTY_CONTENT。网络超时、认证、限流不计入模型修正集合；它们不受这个三次规则拦截，整个请求仍受 max_turns 限制。目前没有全局 API 熔断或跨请求失败禁用。
+
+search_news 按归一化 query、time_range、排序去重的 domains 区分目标，忽略 limit；fetch_article 按归一化 URL 区分，忽略 max_chars 和 extract_depth。URL 统一域名大小写、移除 fragment 与默认端口，保留路径大小写和查询参数。文件目标采用实际绝对路径及 Windows 大小写归一化。每次 submit 新建恢复对象；连续 call_tool 使用 Runtime 当前恢复对象，直到下一次 submit 或 reset。写入状态保护也仅存在于该恢复作用域，不跨请求/进程持久化。
+
+write_file 失败且 execution_status=unknown 时标记目标，后续写入返回 STATE_CHECK_REQUIRED。完整且未截断的 read_file 或确认文件不存在可解除标记；部分读取、超长文件、工具输出截断均不能作为完整检查证据。这里只保护识别到的 write_file/edit_file 目标，不是限制任意 shell 操作的沙箱。
+
+错误结果增加 field、transient、next_action、execution_status、attempts、repair_failures、retry_after 和 recovery_hint。程序中间重试不会添加额外的模型消息，最终结果仍只对应原来的 tool_use_id。ToolResult.success 的 content 保持原有形式。attempts 是本次调用执行次数，修正预算拦截时为 0；日志单独记录 validation/permission/recovery/execution 阶段。
+
+`runtime.recovery.events`（同 `ctx.extra["tool_attempts"]`）最多保留最近 200 条简短记录，参数只保存 SHA-256，不保存正文；省略数查看 `runtime.recovery.dropped_events`。`runtime.recovery.executions` 保留完整执行总计，日志裁剪不影响预算和统计。verbose 显示 `[retry]` 与 `[recovery]`，不输出原始参数。
+
+```dotenv
+AGENT_MAX_TOOL_RETRIES=2
+AGENT_MAX_TOOL_REPAIRS=2
+```
+
+retries 范围 0..5，0 关闭程序重试；repairs 范围 0..10，0 表示首次可修正失败后不再给修正机会。配置仍按显式参数 > 进程环境变量 > .env > 默认值。逐函数解释和执行例子见 [工具恢复代码说明](docs/tool-recovery.md)。
 
 ## 长期记忆
 

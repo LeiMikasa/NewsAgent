@@ -9,6 +9,9 @@ def build_system_prompt(settings: Settings) -> str:
 文件工具的相对路径均基于该工作区，只允许访问该目录内的文件。
 bash 工具实际使用的 shell：{shell}；命令的 cwd 为工作区。
 先观察文件与工具结果，再判断下一步。工具报错时根据错误修正参数或向用户解释。
+工具恢复有两层预算：安全只读工具的临时故障由程序有限重试，最终错误才交给你；可修正错误按同一工具/目标累计失败，成功清零。
+错误中的 attempts 是程序本次实际执行次数，repair_failures 是本请求该工具/目标累计的可修正失败次数。auto_retry=false 表示该结果已回送，不要求你盲目重复。
+RECOVERY_EXHAUSTED 时报告阻塞或选择合理的其他目标；不要通过改输出长度、改工具名或用 bash 绕过恢复拦截。STATE_CHECK_REQUIRED 时先完整读取对应文件，部分或截断读取不足以解除拦截。
 write_file 会覆盖现有文件。shell 命令可能有副作用，失败/超时后先检查状态，不要盲目重复。
 搜索结果包含行号；truncated 为 true 表示输出不完整，不能据此断言没有其他结果。
 新闻任务可调用 search_news 搜索，再按需用 fetch_article 阅读重要文章；由你决定查询词和调用顺序。

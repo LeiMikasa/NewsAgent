@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .registry import Tool, ToolContext, ToolRegistry
 from .result import ToolResult
+from .recovery import normalized_path
 
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".agent"}
 
@@ -72,19 +73,25 @@ def run_read_file(args: dict, ctx: ToolContext) -> ToolResult:
     path = safe_path(ctx, args["path"])
     if path.is_dir():
         raise IsADirectoryError(str(path))
-    text = _read_text(path, ctx.settings.max_file_bytes)
+    inspected = normalized_path(str(path), ctx.workdir)
+    try:
+        text = _read_text(path, ctx.settings.max_file_bytes)
+    except FileNotFoundError:
+        return ToolResult.failure("NOT_FOUND", f"file not found: {args['path']}", action="inspect",
+                                  execution_status="failed", inspected_path=inspected)
     if text is None:
         return ToolResult.failure("FILE_TOO_LARGE", f"file exceeds {ctx.settings.max_file_bytes} bytes")
     # 默认保持完整原文（包括末尾换行）；指定 offset/limit 后返回行窗口。
     if "offset" not in args and "limit" not in args:
-        return ToolResult.success(text)
+        return ToolResult.success(text, inspected_path=inspected if len(text) <= ctx.settings.max_tool_output else None)
     lines = text.splitlines(keepends=True)
     offset = args.get("offset", 1)
     end = min(len(lines), offset - 1 + args.get("limit", len(lines)))
     content = "".join(lines[offset - 1:end])
     return ToolResult.success({"path": relative_path(ctx, path), "offset": offset,
                                "total_lines": len(lines), "content": content,
-                               "truncated": end < len(lines)})
+                               "truncated": end < len(lines)},
+                              inspected_path=inspected if offset == 1 and end == len(lines) else None)
 
 
 def run_search_content(args: dict, ctx: ToolContext) -> ToolResult:
@@ -239,7 +246,8 @@ def run_bash(args: dict, ctx: ToolContext) -> ToolResult:
         result["message"] = (f"timeout after {timeout}s" if timed_out else "command exited with a nonzero status")
         result["next_action"] = "inspect actual state before retrying; side effects may have occurred"
         data = ToolResult.success(result)
-        return ToolResult.failure("TIMEOUT" if timed_out else "COMMAND_FAILED", data.content)
+        return ToolResult.failure("TIMEOUT" if timed_out else "COMMAND_FAILED", data.content,
+                                  action="inspect_state", execution_status="unknown", transient=timed_out)
     return ToolResult.success(result)
 
 
@@ -251,15 +259,15 @@ def register_basic_tools(registry: ToolRegistry) -> None:
     definitions = [
         Tool("list_dir", "List immediate directory entries relative to the workspace.", schema(
             {"path": string, "limit": {"type": "integer", "minimum": 1, "maximum": 1000}}, ["path"]),
-             run_list_dir, read_only=True),
+             run_list_dir, read_only=True, retry_safe=True),
         Tool("read_file", "Read a UTF-8 text file; offset is a 1-based line number. Oversized/binary files are rejected.", schema(
             {"path": string, "offset": {"type": "integer", "minimum": 1},
-             "limit": {"type": "integer", "minimum": 1, "maximum": 5000}}, ["path"]), run_read_file, read_only=True),
+             "limit": {"type": "integer", "minimum": 1, "maximum": 5000}}, ["path"]), run_read_file, read_only=True, retry_safe=True),
         Tool("search_content", "Recursively search UTF-8 file content for a literal keyword (case-insensitive by default). Skips binary/oversized files and dependency/state directories.", schema(
             {"keyword": string, "dir": string, "case_sensitive": {"type": "boolean"},
              "max_results": {"type": "integer", "minimum": 1, "maximum": 1000},
              "max_files": {"type": "integer", "minimum": 1, "maximum": 50000}}, ["keyword", "dir"]),
-             run_search_content, read_only=True),
+             run_search_content, read_only=True, retry_safe=True),
         Tool("write_file", "Write UTF-8 content, creating parent directories; overwrites by default. Set overwrite=false to require a new file.", schema(
             {"path": string, "content": {"type": "string"}, "overwrite": {"type": "boolean"}}, ["path", "content"]), run_write_file),
         Tool("bash", "Execute a host shell command with the workspace as cwd. This is not a filesystem sandbox. Returns stdout, stderr and exit_code; timeout may leave side effects.", schema(

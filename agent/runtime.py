@@ -11,7 +11,7 @@ from .llm import LLMClient, MockLLM, build_client
 from .loop import LoopResult, execute_tool, run_loop
 from .memory import MemoryStore
 from .prompt import build_system_prompt
-from .tools import ToolContext, ToolRegistry, ToolResult, register_basic_tools, register_news_tools
+from .tools import ToolContext, ToolRegistry, ToolResult, ToolRecovery, register_basic_tools, register_news_tools
 
 
 @dataclass
@@ -19,6 +19,7 @@ class RuntimeStats:
     requests: int = 0
     turns: int = 0
     tool_calls: int = 0
+    tool_attempts: int = 0
 
 
 class Runtime:
@@ -34,6 +35,7 @@ class Runtime:
         self.messages: list[dict] = []
         self.stats = RuntimeStats()
         self.ctx = ToolContext(settings, settings.workdir, runtime=self)
+        self.recovery = ToolRecovery(max_retries=settings.max_tool_retries, max_repairs=settings.max_tool_repairs)
         self.on_event = on_event
         # Separate offline bookkeeping from the agent's scripted conversation.
         # Live runtimes reuse the configured client unless explicitly overridden.
@@ -145,14 +147,18 @@ class Runtime:
             if blocked is not None:
                 return LoopResult(stop_reason="blocked", error=str(blocked))
             request_start = len(self.messages)
+            self.recovery = ToolRecovery(max_retries=self.settings.max_tool_retries,
+                                         max_repairs=self.settings.max_tool_repairs)
             self._memory_sections = None
             self._memory_pending = False
             self.messages.append({"role": "user", "content": prompt})
             result = run_loop(llm=self.llm, registry=self.tools, messages=self.messages,
                               system=self.build_system, ctx=self.ctx,
-                              hooks=self.hooks, max_turns=self.settings.max_turns, on_event=self.on_event)
+                              hooks=self.hooks, max_turns=self.settings.max_turns, on_event=self.on_event,
+                              recovery=self.recovery)
             self.stats.turns += result.turns
             self.stats.tool_calls += result.tool_calls
+            self.stats.tool_attempts += result.tool_attempts
             if result.ok and self._memory_pending:
                 self._finish_memory(self.messages[request_start:])
                 self._memory_sections = None
@@ -167,12 +173,14 @@ class Runtime:
         if self._busy:
             raise RuntimeError("runtime is already processing a request")
         self._busy = True
+        initial_executions = self.recovery.executions
         try:
             self._start()
             self.stats.tool_calls += 1
             return execute_tool({"type": "tool_use", "name": name, "input": args},
-                                self.tools, self.ctx, self.hooks)
+                                self.tools, self.ctx, self.hooks, self.recovery, self.on_event)
         finally:
+            self.stats.tool_attempts += self.recovery.executions - initial_executions
             self._busy = False
 
     def reset(self) -> None:
@@ -180,6 +188,8 @@ class Runtime:
             raise RuntimeError("cannot reset an active request")
         self.messages.clear()
         self.ctx.extra.clear()
+        self.recovery = ToolRecovery(max_retries=self.settings.max_tool_retries,
+                                     max_repairs=self.settings.max_tool_repairs)
         self._memory_sections = None
         self._memory_pending = False
 

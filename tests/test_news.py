@@ -28,7 +28,7 @@ class NewsTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="newsagent-news-")
         self.root = Path(self.temporary.name)
         self.settings = Settings(workdir=self.root, memory_enabled=False,
-                                 tavily_api_key="test-secret-key", tavily_timeout=12)
+                                 tavily_api_key="test-secret-key", tavily_timeout=12, max_tool_retries=0)
         self.runtime = Runtime.create(self.settings)
         self.opener = MagicMock()
         self.transport = patch("agent.tools.news.build_opener", return_value=self.opener)
@@ -190,12 +190,13 @@ class NewsTest(unittest.TestCase):
                  ({"unexpected": []}, "INVALID_RESPONSE")]
         for data, code in cases:
             with self.subTest(code=code):
+                self.runtime.reset()  # 每种响应作为独立调用场景验证，恢复预算另有专项测试。
                 self.serve(data)
                 result = self.runtime.call_tool("fetch_article", url="https://example.com/news")
                 self.assertEqual(result.error_code, code)
                 self.assertNotIn("test-secret-key", result.content)
 
-    def test_http_errors_are_classified_without_leaking_secrets_or_retrying(self):
+    def test_http_errors_are_classified_without_leaking_secrets_with_retries_disabled(self):
         for status, code in [(400, "INVALID_REQUEST"), (401, "AUTH_ERROR"), (403, "AUTH_ERROR"),
                              (422, "INVALID_REQUEST"), (429, "RATE_LIMITED"), (432, "QUOTA_EXCEEDED"),
                              (433, "QUOTA_EXCEEDED"), (503, "UPSTREAM_ERROR"), (302, "UPSTREAM_ERROR")]:
