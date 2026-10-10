@@ -1,7 +1,7 @@
 # NewsAgent
 
-每日 AI 新闻助手：agent loop、runtime、hooks、5 个基础工具、2 个 Tavily 新闻工具，以及基于 Markdown 的长期记忆。
-代码结构参照 `D:\HarnessAgent` 的 Python 分层。支持按请求搜索新闻和提取网页正文，由 Agent 决定工具调用顺序；历史简报、每日调度与推送尚未实现。
+每日 AI 新闻助手：agent loop、runtime、hooks、5 个基础工具、2 个 Tavily 新闻工具、基于 Markdown 的长期记忆，以及本地简报归档。
+代码结构参照 `D:\HarnessAgent` 的 Python 分层。支持按请求搜索新闻和提取网页正文，由 Agent 决定工具调用顺序；支持生成后保存简报与查看历史，每日调度与推送尚未实现。
 
 ## 运行
 
@@ -53,6 +53,7 @@ agent/
   llm.py           统一 LLMClient、Anthropic 兼容客户端、MockLLM
   loop.py          run_loop、execute_tool、LoopResult
   runtime.py       组件组装、会话消息、统计、生命周期
+  briefs.py        Markdown 简报归档、元信息、历史分页与读取
   memory.py        从 HarnessAgent 复用的长期记忆：保存、召回、提取、整理
   onboarding.py    首次身份与偏好引导、资料查看与编辑
   events.py        Hooks、StopDirective
@@ -177,7 +178,65 @@ Stop hook 返回 `StopDirective("continue", "请再检查文件内容")` 可以�
 
 PreToolUse hook 异常会阻止执行。PostToolUse 异常保留实际工具结果、继续通知其他观察者，并记录在 `runtime.ctx.extra["hook_errors"]`。
 
-`runtime.messages` 在内存中保存会话，`runtime.stats` 汇总用户请求的模型轮数、工具调用次数和实际执行次数，不包含额外的记忆模型调用。各 runtime 的 hooks 与对话状态相互独立；同一实例采用同步调用并阻止请求重入。同一工作区的 Runtime 会读取相同的持久记忆目录，当前面向单用户使用。本阶段未加入对话记录落盘、上下文压缩和调度器。
+`runtime.messages` 在内存中保存会话，`runtime.stats` 汇总用户请求的模型轮数、工具调用次数和实际执行次数，不包含额外的记忆模型调用。各 runtime 的 hooks 与对话状态相互独立；同一实例采用同步调用并阻止请求重入。同一工作区的 Runtime 会读取相同的持久记忆与简报目录，当前面向单用户使用。本阶段未加入完整对话记录落盘、上下文压缩和调度器。
+
+## 简报保存与历史
+
+使用明确的简报入口生成并归档，普通 `submit()` / 普通聊天不自动保存。归档发生在现有 Agent loop 返回最终文本之后，搜索、文章选择和工具调用仍由模型决定；没有增加固定新闻工作流或额外的归档模型调用。
+
+```powershell
+# 配置真实模型与 Tavily Key；先建立身份和偏好
+.\.venv\Scripts\python.exe -m agent --setup-profile
+# 按长期偏好生成今日简报，完成后自动保存
+.\.venv\Scripts\python.exe -m agent --brief
+# 自定义本次请求和归档标题
+.\.venv\Scripts\python.exe -m agent "生成今天的开源模型新闻简报" --brief --brief-title "开源模型日报"
+# 查看最近 20 份历史，读取指定编号
+.\.venv\Scripts\python.exe -m agent --list-briefs
+.\.venv\Scripts\python.exe -m agent --read-brief "替换为历史列表中的ID"
+# JSON 输出可供后续前端或调度入口使用
+.\.venv\Scripts\python.exe -m agent --brief --json
+```
+
+交互模式：`/brief` 生成并保存；`/brief 关注开源模型，选五条` 指定本次请求；`/briefs` 列出历史；`/read-brief ID` 查看正文。`/reset` 清空对话，保留磁盘简报和长期记忆。
+
+默认目录为工作区内的 `.agent/briefs/`，按北京时间（Asia/Shanghai，UTC+08:00）命名；编号末尾加入随机后缀，同一秒生成多份也不覆盖。相同日期的多次生成分别保留。
+
+```text
+.agent/briefs/
+  2026-10-10_080000_a1b2c3d4.md
+  2026-10-10_080000_e5f6a7b8.md
+```
+
+每个文件在 YAML frontmatter 中保存编号、标题、生成时间、时区、模型/provider、模型轮数、工具调用次数、实际执行次数和正文 UTF-8 字节数，后面是最终回复的完整 Markdown 正文。标题优先使用显式标题，否则取正文的首个 Markdown 标题，最后回退为日期标题。归档不保存 API Key、完整对话或用户资料副本；正文中的来源链接保留原样。
+
+正文和元信息先写入同目录临时文件并 fsync，再以不可覆盖的方式一次发布；没有单独的索引文件或元信息侧文件。失败、拒绝、轮数耗尽、不完整响应和空白文本不归档。保存失败时保留生成文本与 `save_error`，不会重新调用模型，CLI 返回非零退出码。默认未设置脚本的 mock 只返回框架状态，简报入口会提示配置真实模型，不把状态提示当作新闻保存。
+
+开启记忆且资料缺失时，需要先设置身份和偏好；交互引导可以 `/skip`，或使用 `--no-memory` 生成通用简报，避免把询问用户资料的回复归档。保存条件检查的是 Agent 正常结束且有非空文本，仍应检查实际新闻质量；它不等于所有工具成功或报道已经核实。
+
+`--brief --json` 输出 `{ "result": <LoopResult>, "brief": <元信息或null>, "save_error": "..." }`；普通 `--json` 仍输出原有 LoopResult。历史 JSON 列表只含元信息，单份读取包含 `content`。读取历史直接访问本地归档，不创建模型客户端，不询问资料。
+
+目录可用 `AGENT_BRIEFS_DIR`、`--briefs-dir` 或 `Settings(briefs_dir=...)` 配置，优先级仍是显式参数 > 进程环境变量 > .env > 默认值；必须位于工作区子目录，不能与记忆目录重叠。默认 `.agent/` 已在 `.gitignore` 中；使用其他目录时请加入忽略规则。正文上限沿用 `AGENT_MAX_FILE_BYTES`（默认 2 MB），超限报错，不悄悄截断归档。历史列表只读有界文件头，保留有限条元信息，不加载全部简报正文；损坏的文件头会跳过，单份读取会检查正文长度。当前没有删除、全文搜索或定时任务。
+
+```python
+from pathlib import Path
+from agent import Runtime, load_settings
+
+settings = load_settings(workdir=Path("D:/NewsAgent"))
+with Runtime.create(settings) as runtime:
+    generated = runtime.generate_brief("请按我的长期偏好生成今日简报")
+    if generated.ok:
+        print(generated.brief["path"])
+    else:
+        print(generated.result.error or generated.save_error)
+
+    page = runtime.briefs.list(limit=20)
+    if page:
+        print(runtime.briefs.get(page[0]["id"])["content"])
+        next_page = runtime.briefs.list(limit=20, before=page[-1]["id"])
+```
+
+`BriefStore.save(content, title=...)` 也可直接归档已确认的 Markdown 正文。`runtime.generate_brief()` 返回 `BriefResult`，只有生成正常结束且归档成功时 `ok` 才为真；生成结果保存在 `result`，归档元信息保存在 `brief`。
 
 ## 工具失败恢复
 

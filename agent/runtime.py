@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable
 
+from .briefs import BriefStore, SHANGHAI
 from .config import Settings, load_settings
 from .events import Hooks, SESSION_END, SESSION_START, STOP, USER_PROMPT_SUBMIT
 from .llm import LLMClient, MockLLM, build_client
@@ -22,6 +24,17 @@ class RuntimeStats:
     tool_attempts: int = 0
 
 
+@dataclass
+class BriefResult:
+    result: LoopResult
+    brief: dict | None = None
+    save_error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.result.ok and self.brief is not None and not self.save_error
+
+
 class Runtime:
     def __init__(self, settings: Settings, llm: LLMClient, *, hooks: Hooks | None = None,
                  tools: ToolRegistry | None = None, on_event: Callable[[str], None] | None = None,
@@ -37,6 +50,8 @@ class Runtime:
         self.ctx = ToolContext(settings, settings.workdir, runtime=self)
         self.recovery = ToolRecovery(max_retries=settings.max_tool_retries, max_repairs=settings.max_tool_repairs)
         self.on_event = on_event
+        self.briefs = BriefStore(settings.workdir, settings.briefs_dir,
+                                 max_content_bytes=settings.max_file_bytes)
         # Separate offline bookkeeping from the agent's scripted conversation.
         # Live runtimes reuse the configured client unless explicitly overridden.
         self.memory_llm = memory_llm if memory_llm is not None else (
@@ -167,6 +182,35 @@ class Runtime:
             return LoopResult(stop_reason="error", error=f"{type(exc).__name__}: {exc}")
         finally:
             self._busy = False
+
+    def generate_brief(self, prompt: str | None = None, *, title: str | None = None) -> BriefResult:
+        """Generate via the existing loop, then archive its completed final text."""
+        if self._closed or self._busy:
+            raise RuntimeError("cannot generate a brief while runtime is closed or busy")
+        if self.memory.enabled and self.missing_profile_fields and not self.ctx.extra.get("profile_setup_skipped"):
+            return BriefResult(LoopResult(stop_reason="blocked",
+                error="请先通过 --setup-profile 或 /profile edit 设置身份和偏好；通用简报可用 --no-memory 或交互时 /skip。"))
+        if (isinstance(self.llm, MockLLM) and self.llm.script is None and self.llm.responder is None):
+            return BriefResult(LoopResult(stop_reason="blocked",
+                error="默认 mock 只返回框架状态，无法生成简报。请配置真实模型，或使用 mock script/responder 做离线测试。"))
+        request = (f"当前日期为 {datetime.now(SHANGHAI):%Y-%m-%d}（Asia/Shanghai）。"
+                   "请根据我的身份和长期订阅偏好生成今日 AI 新闻简报，给出来源链接和日期，"
+                   "区分报道事实与分析。" if prompt is None else prompt)
+        result = self.submit(request)
+        generated = BriefResult(result)
+        if not result.ok:
+            return generated
+        self._busy = True
+        try:
+            generated.brief = self.briefs.save(result.text, title=title,
+                                               provider=self.settings.provider, model=self.settings.model,
+                                               turns=result.turns, tool_calls=result.tool_calls,
+                                               tool_attempts=result.tool_attempts)
+        except (OSError, ValueError, UnicodeError, RuntimeError) as exc:
+            generated.save_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._busy = False
+        return generated
 
     def call_tool(self, name: str, **args) -> ToolResult:
         """直接调用仍走相同的参数校验与 Pre/PostToolUse 链路。"""

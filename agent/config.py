@@ -31,6 +31,7 @@ class Settings:
     tavily_timeout: float = 30
     max_tool_retries: int = 2
     max_tool_repairs: int = 2
+    briefs_dir: Path | None = None
 
     def __post_init__(self) -> None:
         self.workdir = Path(self.workdir).expanduser().resolve()
@@ -45,6 +46,12 @@ class Settings:
         self.memory_dir = (memory_path if memory_path.is_absolute() else self.workdir / memory_path).resolve()
         if not self.memory_dir.is_relative_to(self.workdir) or self.memory_dir == self.workdir:
             raise ValueError("memory_dir must be a subdirectory of workdir")
+        briefs_path = Path(self.briefs_dir).expanduser() if self.briefs_dir is not None else Path(".agent/briefs")
+        self.briefs_dir = (briefs_path if briefs_path.is_absolute() else self.workdir / briefs_path).resolve()
+        if not self.briefs_dir.is_relative_to(self.workdir) or self.briefs_dir == self.workdir:
+            raise ValueError("briefs_dir must be a subdirectory of workdir")
+        if self.briefs_dir.is_relative_to(self.memory_dir) or self.memory_dir.is_relative_to(self.briefs_dir):
+            raise ValueError("briefs_dir must not overlap memory_dir")
         for name in ("memory_enabled", "memory_auto_extract"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a boolean")
@@ -91,6 +98,7 @@ def load_settings(env_file: str | Path | None = None, **overrides) -> Settings:
         "max_file_bytes": ("AGENT_MAX_FILE_BYTES", int),
         "shell": ("AGENT_SHELL", str),
         "memory_dir": ("AGENT_MEMORY_DIR", Path),
+        "briefs_dir": ("AGENT_BRIEFS_DIR", Path),
         "tavily_api_key": ("TAVILY_API_KEY", str),
         "tavily_timeout": ("TAVILY_TIMEOUT", float),
         "max_tool_retries": ("AGENT_MAX_TOOL_RETRIES", int),
