@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -32,6 +33,13 @@ class Settings:
     max_tool_retries: int = 2
     max_tool_repairs: int = 2
     briefs_dir: Path | None = None
+    email_enabled: bool = False
+    smtp_host: str = "smtp.qq.com"
+    smtp_port: int = 465
+    smtp_username: str | None = None
+    smtp_password: str | None = field(default=None, repr=False)
+    email_to: str | None = None
+    smtp_timeout: float = 30
 
     def __post_init__(self) -> None:
         self.workdir = Path(self.workdir).expanduser().resolve()
@@ -52,7 +60,7 @@ class Settings:
             raise ValueError("briefs_dir must be a subdirectory of workdir")
         if self.briefs_dir.is_relative_to(self.memory_dir) or self.memory_dir.is_relative_to(self.briefs_dir):
             raise ValueError("briefs_dir must not overlap memory_dir")
-        for name in ("memory_enabled", "memory_auto_extract"):
+        for name in ("memory_enabled", "memory_auto_extract", "email_enabled"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a boolean")
         for name, maximum in (("max_tool_retries", 5), ("max_tool_repairs", 10)):
@@ -76,6 +84,25 @@ class Settings:
                 raise ValueError(f"{name} must be between 0 and 3600 seconds")
         if self.provider != "mock" and (not self.model or self.model == "mock-1"):
             raise ValueError("set MODEL_ID to the model supported by your provider")
+        if not isinstance(self.smtp_host, str) or not re.fullmatch(r"[A-Za-z0-9.-]+", self.smtp_host):
+            raise ValueError("smtp_host must be a hostname")
+        if isinstance(self.smtp_port, bool) or not isinstance(self.smtp_port, int) or not 1 <= self.smtp_port <= 65535:
+            raise ValueError("smtp_port must be between 1 and 65535")
+        if (isinstance(self.smtp_timeout, bool) or not isinstance(self.smtp_timeout, (int, float))
+                or not 0 < self.smtp_timeout <= 120):
+            raise ValueError("smtp_timeout must be between 0 and 120 seconds")
+        for name in ("smtp_username", "email_to"):
+            value = getattr(self, name)
+            if value is not None:
+                if (not isinstance(value, str) or len(value) > 320
+                        or not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}", value.strip())):
+                    raise ValueError(f"{name} must be a single email address")
+                setattr(self, name, value.strip())
+        if self.smtp_password is not None:
+            if (not isinstance(self.smtp_password, str) or len(self.smtp_password) > 4096
+                    or any(ord(char) < 32 for char in self.smtp_password)):
+                raise ValueError("smtp_password must be a single-line authorization code")
+            self.smtp_password = self.smtp_password.strip()
 
 
 def load_settings(env_file: str | Path | None = None, **overrides) -> Settings:
@@ -103,6 +130,12 @@ def load_settings(env_file: str | Path | None = None, **overrides) -> Settings:
         "tavily_timeout": ("TAVILY_TIMEOUT", float),
         "max_tool_retries": ("AGENT_MAX_TOOL_RETRIES", int),
         "max_tool_repairs": ("AGENT_MAX_TOOL_REPAIRS", int),
+        "smtp_host": ("SMTP_HOST", str),
+        "smtp_port": ("SMTP_PORT", int),
+        "smtp_username": ("SMTP_USERNAME", str),
+        "smtp_password": ("SMTP_PASSWORD", str),
+        "email_to": ("EMAIL_TO", str),
+        "smtp_timeout": ("SMTP_TIMEOUT", float),
     }
     resolved = {}
     for field_name, (env_name, converter) in mapping.items():
@@ -111,7 +144,8 @@ def load_settings(env_file: str | Path | None = None, **overrides) -> Settings:
             resolved[field_name] = converter(value)
     for field_name, env_name in (("allow_bash", "AGENT_ALLOW_BASH"),
                                  ("memory_enabled", "AGENT_MEMORY_ENABLED"),
-                                 ("memory_auto_extract", "AGENT_MEMORY_AUTO_EXTRACT")):
+                                 ("memory_auto_extract", "AGENT_MEMORY_AUTO_EXTRACT"),
+                                 ("email_enabled", "EMAIL_ENABLED")):
         raw_bool = values.get(env_name)
         if raw_bool is not None:
             if raw_bool.lower() not in {"true", "false", "1", "0"}:

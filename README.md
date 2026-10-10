@@ -1,7 +1,19 @@
 # NewsAgent
 
 每日 AI 新闻助手：agent loop、runtime、hooks、5 个基础工具、2 个 Tavily 新闻工具、基于 Markdown 的长期记忆，以及本地简报归档。
-代码结构参照 `D:\HarnessAgent` 的 Python 分层。支持按请求搜索新闻和提取网页正文，由 Agent 决定工具调用顺序；支持生成后保存简报与查看历史，每日调度与推送尚未实现。
+代码结构参照 `D:\HarnessAgent` 的 Python 分层。支持按请求搜索新闻和提取网页正文，由 Agent 决定工具调用顺序；支持生成后保存简报与查看历史，以及 FastAPI 单用户后端、每日定时生成和 QQ 邮箱推送。React 前端提供阅读、历史、身份偏好与订阅设置页面。
+
+## 浏览器界面
+
+```powershell
+cd D:\NewsAgent\frontend
+npm.cmd install
+npm.cmd run build
+cd ..
+.\.venv\Scripts\python.exe -m backend
+```
+
+打开 `http://127.0.0.1:8000`。首次在「订阅设置」中填写身份与偏好，再生成简报；已有 CLI 资料和历史直接复用。构建完成后，平时只需启动后端。开发模式、页面功能和代码结构见 [前端说明](docs/frontend.md)。
 
 ## 运行
 
@@ -32,6 +44,25 @@ demo 使用离线脚本驱动实际的 loop：写入 `.agent/demo/news.txt`，�
 ```
 
 其他参数：`--workdir` 指定工作区，`--env-file` 指定配置文件，`--max-turns` 限制模型轮数，`--no-bash` 禁用 shell，`--verbose` 输出进度及记忆诊断。
+
+## 单用户后端与订阅时间
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m backend
+```
+
+打开 `http://127.0.0.1:8000/docs`：保存身份和新闻偏好，提交生成任务，设置每日时间，查看任务状态和历史简报。订阅默认关闭，时区为北京时间；后端进程需要保持运行。修改时间后立即更新下一次触发，不需要重启。
+
+FastAPI 和 APScheduler 同进程运行，手动与定时生成共用一个工作线程，每次创建独立 Runtime；资料仍存 Markdown，订阅设置和执行记录存 `.agent/backend.sqlite3`。后端重启会恢复订阅，将未完成任务标记为中断，并按一小时窗口检查当天补跑。同一天定时生成最多尝试一次；失败后可以手动重试。
+
+完整接口、存储和调度规则见 [单用户后端文档](docs/backend.md)。
+
+### QQ 邮箱推送
+
+在本地 `.env` 中设置 `EMAIL_ENABLED=true`、`SMTP_USERNAME=自己的QQ邮箱`、`SMTP_PASSWORD=邮箱授权码`，重启后端。默认使用 `smtp.qq.com:465`（SSL），收件地址不填时发到自己；也可用 `EMAIL_TO` 指定地址。邮箱授权码通过 QQ 邮箱开启 SMTP 服务后取得，不使用网页登录密码。
+
+定时简报成功保存后自动发送正文和 Markdown 附件；邮件失败保留简报，并记录独立邮件状态。`GET /api/email` 查看配置是否就绪，`POST /api/runs/{id}/send-email` 直接发送或重试已有简报，不再调用模型。配置与发送状态详见 [QQ 邮箱推送文档](docs/email.md)。
 
 ## 接入真实模型
 
@@ -191,7 +222,7 @@ Stop hook 返回 `StopDirective("continue", "请再检查文件内容")` 可以�
 
 PreToolUse hook 异常会阻止执行。PostToolUse 异常保留实际工具结果、继续通知其他观察者，并记录在 `runtime.ctx.extra["hook_errors"]`。
 
-`runtime.messages` 在内存中保存会话，`runtime.stats` 汇总用户请求的模型轮数、工具调用次数和实际执行次数，不包含额外的记忆模型调用。各 runtime 的 hooks 与对话状态相互独立；同一实例采用同步调用并阻止请求重入。同一工作区的 Runtime 会读取相同的持久记忆与简报目录，当前面向单用户使用。本阶段未加入完整对话记录落盘、上下文压缩和调度器。
+`runtime.messages` 在内存中保存会话，`runtime.stats` 汇总用户请求的模型轮数、工具调用次数和实际执行次数，不包含额外的记忆模型调用。各 runtime 的 hooks 与对话状态相互独立；同一实例采用同步调用并阻止请求重入。同一工作区的 Runtime 会读取相同的持久记忆与简报目录，当前面向单用户使用。定时调度由 `backend` 提供；目前未加入完整对话记录落盘和上下文压缩。
 
 ## 简报保存与历史
 
@@ -207,7 +238,7 @@ PreToolUse hook 异常会阻止执行。PostToolUse 异常保留实际工具结�
 # 查看最近 20 份历史，读取指定编号
 .\.venv\Scripts\python.exe -m agent --list-briefs
 .\.venv\Scripts\python.exe -m agent --read-brief "替换为历史列表中的ID"
-# JSON 输出可供后续前端或调度入口使用
+# CLI 的结构化生成与归档结果
 .\.venv\Scripts\python.exe -m agent --brief --json
 ```
 
@@ -229,7 +260,7 @@ PreToolUse hook 异常会阻止执行。PostToolUse 异常保留实际工具结�
 
 `--brief --json` 输出 `{ "result": <LoopResult>, "brief": <元信息或null>, "save_error": "..." }`；普通 `--json` 仍输出原有 LoopResult。历史 JSON 列表只含元信息，单份读取包含 `content`。读取历史直接访问本地归档，不创建模型客户端，不询问资料。
 
-目录可用 `AGENT_BRIEFS_DIR`、`--briefs-dir` 或 `Settings(briefs_dir=...)` 配置，优先级仍是显式参数 > 进程环境变量 > .env > 默认值；必须位于工作区子目录，不能与记忆目录重叠。默认 `.agent/` 已在 `.gitignore` 中；使用其他目录时请加入忽略规则。正文上限沿用 `AGENT_MAX_FILE_BYTES`（默认 2 MB），超限报错，不悄悄截断归档。历史列表只读有界文件头，保留有限条元信息，不加载全部简报正文；损坏的文件头会跳过，单份读取会检查正文长度。当前没有删除、全文搜索或定时任务。
+目录可用 `AGENT_BRIEFS_DIR`、`--briefs-dir` 或 `Settings(briefs_dir=...)` 配置，优先级仍是显式参数 > 进程环境变量 > .env > 默认值；必须位于工作区子目录，不能与记忆目录重叠。默认 `.agent/` 已在 `.gitignore` 中；使用其他目录时请加入忽略规则。正文上限沿用 `AGENT_MAX_FILE_BYTES`（默认 2 MB），超限报错，不悄悄截断归档。历史列表只读有界文件头，保留有限条元信息，不加载全部简报正文；损坏的文件头会跳过，单份读取会检查正文长度。当前没有删除与全文搜索；CLI 不启动定时器，定时生成使用 `python -m backend`。
 
 ```python
 from pathlib import Path
