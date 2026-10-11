@@ -1,366 +1,255 @@
 # NewsAgent
 
-每日 AI 新闻助手：agent loop、runtime、hooks、5 个基础工具、2 个 Tavily 新闻工具、基于 Markdown 的长期记忆，以及本地简报归档。
-代码结构参照 `D:\HarnessAgent` 的 Python 分层。支持按请求搜索新闻和提取网页正文，由 Agent 决定工具调用顺序；支持生成后保存简报与查看历史，以及 FastAPI 单用户后端、每日定时生成和 QQ 邮箱推送。React 前端提供阅读、历史、身份偏好与订阅设置页面。
+每日 AI 新闻助手，根据用户身份、订阅偏好和本次要求搜索新闻、阅读文章并生成个性化简报。新闻主题由用户选择，可关注财经、体育、教育、科技等领域。
 
-## 浏览器界面
+支持浏览器阅读、历史简报、长期记忆、每日定时生成和 QQ 邮箱推送，也提供命令行交互入口。
+
+## 功能
+
+- **个性化简报**：根据身份和偏好检索、筛选新闻，输出正文、来源链接和日期。
+- **新闻工具**：使用 Tavily 搜索新闻、提取文章正文，工具调用顺序由 Agent 决定。
+- **长期记忆**：身份和偏好保存为 Markdown；核心资料固定加载，其他记忆按请求召回。
+- **历史简报**：生成成功后归档，支持浏览、读取和下载 Markdown。
+- **每日订阅**：在前端设置北京时间的生成时间，支持启用和暂停。
+- **邮件推送**：定时简报成功保存后，可通过 QQ 邮箱发送正文和 Markdown 附件。
+- **Agent 基础能力**：工具调用、生命周期钩子、工具失败恢复，以及空响应和截断响应恢复。
+
+## 快速开始
+
+需要：
+
+- Python **3.12 或更高版本**。
+- Node.js **22.12 或更高版本**，包含 npm。
+- Git。
+- 一个可用的模型 API Key 和模型 ID，以及 Tavily API Key。
+
+以下命令使用 Windows PowerShell，在你希望存放项目的目录中执行。
+
+### 1. 下载项目并安装后端依赖
 
 ```powershell
-cd D:\NewsAgent\frontend
-npm.cmd install
-npm.cmd run build
-cd ..
-.\.venv\Scripts\python.exe -m backend
-```
+git clone https://github.com/LeiMikasa/NewsAgent.git
+cd NewsAgent
 
-打开 `http://127.0.0.1:8000`。首次在「订阅设置」中填写身份与偏好，再生成简报；已有 CLI 资料和历史直接复用。构建完成后，平时只需启动后端。开发模式、页面功能和代码结构见 [前端说明](docs/frontend.md)。
-
-## 运行
-
-需要 Python 3.12+。项目已建立 `.venv` 并安装依赖，直接在 PowerShell 运行：
-
-```powershell
-cd D:\NewsAgent
-.\.venv\Scripts\python.exe -m agent --demo --verbose
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
-```
-
-首次安装或换机器时：
-
-```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
 
-demo 使用离线脚本驱动实际的 loop：写入 `.agent/demo/news.txt`，列出目录、读取、搜索，执行 `echo`，共 3 次模型响应、5 次工具调用。重复运行会覆盖该示例文件。任何工具失败都会使 demo 以非零状态退出。
-
-默认 provider 为 `mock`，不需要 API key。普通 mock 请求只回复框架状态；任意任务需要真实模型或自行传入 mock `script` / `responder`。
-
-```powershell
-# 单次请求，结构化输出
-.\.venv\Scripts\python.exe -m agent "检查当前目录" --json
-# 交互模式；首次询问身份与订阅偏好，/reset 清空对话，/exit 退出
-.\.venv\Scripts\python.exe -m agent
-```
-
-其他参数：`--workdir` 指定工作区，`--env-file` 指定配置文件，`--max-turns` 限制模型轮数，`--no-bash` 禁用 shell，`--verbose` 输出进度及记忆诊断。
-
-## 单用户后端与订阅时间
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m backend
-```
-
-打开 `http://127.0.0.1:8000/docs`：保存身份和新闻偏好，提交生成任务，设置每日时间，查看任务状态和历史简报。订阅默认关闭，时区为北京时间；后端进程需要保持运行。修改时间后立即更新下一次触发，不需要重启。
-
-FastAPI 和 APScheduler 同进程运行，手动与定时生成共用一个工作线程，每次创建独立 Runtime；资料仍存 Markdown，订阅设置和执行记录存 `.agent/backend.sqlite3`。后端重启会恢复订阅，将未完成任务标记为中断，并按一小时窗口检查当天补跑。同一天定时生成最多尝试一次；失败后可以手动重试。
-
-完整接口、存储和调度规则见 [单用户后端文档](docs/backend.md)。
-
-### QQ 邮箱推送
-
-在本地 `.env` 中设置 `EMAIL_ENABLED=true`、`SMTP_USERNAME=自己的QQ邮箱`、`SMTP_PASSWORD=邮箱授权码`，重启后端。默认使用 `smtp.qq.com:465`（SSL），收件地址不填时发到自己；也可用 `EMAIL_TO` 指定地址。邮箱授权码通过 QQ 邮箱开启 SMTP 服务后取得，不使用网页登录密码。
-
-定时简报成功保存后自动发送正文和 Markdown 附件；邮件失败保留简报，并记录独立邮件状态。`GET /api/email` 查看配置是否就绪，`POST /api/runs/{id}/send-email` 直接发送或重试已有简报，不再调用模型。配置与发送状态详见 [QQ 邮箱推送文档](docs/email.md)。
-
-## 接入真实模型
-
-```powershell
 Copy-Item .env.example .env
 ```
 
-编辑 `.env`：设置 `AGENT_PROVIDER=anthropic` 或 `deepseek`，填写服务实际支持的 `MODEL_ID`、自己的 `ANTHROPIC_API_KEY`，以及可选 `ANTHROPIC_BASE_URL`。DeepSeek 模式未指定端点时使用 `https://api.deepseek.com/anthropic`。
+如果已经有自己的 `.env`，保留现有文件，按 `.env.example` 补充需要的配置即可。
 
-两种 live provider 沿用 HarnessAgent 的 Anthropic Messages 兼容接口。`.env` 已加入忽略规则；本项目未读取或复制 HarnessAgent 的密钥。真实 API 调用需要自行配置凭据，离线验证不发送模型 API 请求。
+### 2. 配置模型和新闻工具
 
-配置优先级：显式参数 > 进程环境变量 > `.env` > 默认值。默认读取启动目录下的 `.env`，工作区默认是启动目录。加载配置不会修改进程环境变量。
-
-## 结构与执行流程
-
-```text
-agent/
-  config.py        配置与校验
-  llm.py           统一 LLMClient、Anthropic 兼容客户端、MockLLM
-  loop.py          run_loop、execute_tool、LoopResult
-  runtime.py       组件组装、会话消息、统计、生命周期
-  briefs.py        Markdown 简报归档、元信息、历史分页与读取
-  memory.py        从 HarnessAgent 复用的长期记忆：保存、召回、提取、整理
-  onboarding.py    首次身份与偏好引导、资料查看与编辑
-  events.py        Hooks、StopDirective
-  prompt.py        系统提示词
-  tools/
-    registry.py    工具定义、JSON Schema 校验、dispatch
-    result.py      统一成功/失败结果
-    recovery.py    HarnessAgent 两层预算：程序重试、模型修正与写入状态保护
-    basic.py       5 个基础工具
-    news.py        Tavily 搜索、正文提取、HTTP 和输出边界
-  cli.py           单次请求与 REPL
-  demo.py          离线工具流程
-tests/
-  test_agent.py    闭环及失败路径测试
-  test_memory.py   跨启动持久化、偏好更新、召回缓存、记忆保护与引导测试
-  test_news.py     新闻 API 参数、错误、截断、Hooks 与搜索/阅读闭环（离线）
-  test_tool_recovery.py  故障注入、次数边界、目标归一化、状态检查与日志上限
-  test_incomplete_response.py  空响应恢复、正文重写、截断工具保护与保存边界
-```
-
-流程：`submit → UserPromptSubmit → 模型 → PreToolUse → 工具 → PostToolUse → tool_result → 模型 → Stop`。
-
-loop 支持单轮多个工具调用，顺序执行并按调用 ID 回送结果。每轮重新读取工具定义，新增工具无需修改 loop。`LoopResult` 包含 `text`、`turns`、`tool_calls`、`tool_attempts`、`stop_reason` 和 `error`；tool_calls 统计提出的工具调用，tool_attempts 统计 handler 实际执行（包括内部重试），参数/策略拦截不计执行。只有 `stop_reason=final` 时 `ok=True`，不代表所有工具成功或业务任务完成。
-
-工具错误回送模型用于修正或解释；有副作用的工具不自动重试。模型请求异常返回 `error`，轮数耗尽返回 `max_turns`。收到 `max_tokens` / `pause_turn` 时不会执行响应中的工具。
-
-### 模型不完整响应恢复
-
-沿用 HarnessAgent 的小额恢复预算：空响应、只有思考/空白文本的响应、`max_tokens` 截断共用最多 **2 次额外模型请求**。例如连续 3 次空响应后返回 `incomplete`；有效响应（包括完整工具调用）会重置连续计数。恢复请求也计入 `turns` 和 `max_turns`，每次新用户请求独立计数。这与工具内部重试、模型修正工具参数的预算分别计算。
-
-- 空响应与只有思考块的响应丢弃，不放入对话历史、不触发 Stop。
-- 正文截断时保留纯文本草稿，要求模型依据草稿和已有工具结果从头重写一份完整、精简的正文，包含必要章节与来源链接。最终只保存这份有效回复，不拼接草稿和尾段；截断的思考块不发回服务端。
-- 工具调用截断时整批丢弃，即使其中一个调用看似完整也不会执行。要求模型重新生成一个小而完整的调用，之前已完成的工具结果保留，不重放历史调用。
-
-`refusal` 直接返回 `blocked`；`pause_turn` 保持返回 `incomplete`，均不自动恢复。恢复耗尽、模型请求错误或轮数耗尽时，不进行自动记忆提取与简报归档。`--verbose` 可查看 `[model recovery]` 进度。
-
-此机制处理服务端报告的截断及空内容，不评估非空回复是否真正完成新闻任务；本次没有引入目标评估模型。
-
-## 工具签名
-
-模型工具参数采用 JSON object，拒绝缺失、类型错误及未声明参数。
-
-| 工具 | 必需参数 | 可选参数 | 行为 |
-| --- | --- | --- | --- |
-| `list_dir` | `path` | `limit=200` | 列出直接子项名称、类型、大小 |
-| `read_file` | `path` | `offset=1`, `limit` | 读取 UTF-8 原文；窗口以 1 开始的行号计数 |
-| `search_content` | `keyword`, `dir` | `case_sensitive=false`, `max_results=100`, `max_files=5000` | 递归字面量搜索，返回文件路径、行号、匹配行 |
-| `write_file` | `path`, `content` | `overwrite=true` | UTF-8 写入，创建父目录；返回字节数 |
-| `bash` | `command` | `timeout=30` 秒，最多 300 秒 | 返回 shell、退出码、stdout、stderr、超时与截断标记 |
-| `search_news` | `query` | `time_range="day"`, `domains=[]`, `limit=10` | 搜索近期新闻，返回标题、链接、域名、估计日期、相关分数、内容片段 |
-| `fetch_article` | `url` | `max_chars=12000`, `extract_depth="basic"` | 用 Tavily Extract 读取单篇网页，返回 Markdown 正文和截断信息 |
-
-文件路径相对工作区解析，拒绝通过 `..`、绝对路径、symlink / junction 访问外部。文本单文件默认限制 2 MB，二进制与非 UTF-8 文件不作为文本读取。搜索跳过 `.git`、`.venv`、`venv`、`node_modules`、`__pycache__`、`.agent` 子目录，且不遍历目录链接；显式指定 `.agent/demo` 为搜索根目录时仍可搜索。
-
-目录列表、搜索与 shell 有独立的输出/扫描上限。工具内容默认最多 20000 字符，超出时附加 `[output truncated]`；结构化内容的文本也可能被截断。搜索结果中的跳过计数与截断标记表示搜索范围不完整。
-
-`write_file` 使用同目录临时文件与原子替换；`overwrite=false` 要求目标不存在。`bash` 自动优先使用 Bash，Windows 找不到时使用 PowerShell，POSIX 则使用 sh。`AGENT_SHELL` 可指定名称或可执行文件路径。Windows 隐藏 shell 窗口，超时尝试终止进程树。
-
-**bash 使用宿主权限，cwd 不构成沙箱。** 文件工具的路径限制不会限制 shell 命令；可设置 `AGENT_ALLOW_BASH=false`。
-
-## Tavily 新闻工具
-
-在项目 `.env` 中填写自己的 `TAVILY_API_KEY`，可配置 `TAVILY_TIMEOUT=30`（单次 socket 超时，最多 120 秒）。这个 Key 与模型的 `ANTHROPIC_API_KEY` 独立；没有 Tavily Key 不妨碍基础工具与手动资料管理，新闻工具会返回 `MISSING_API_KEY`。本实现使用 Python 标准库 `urllib` 直接请求官方 REST API，不需要额外安装 Tavily SDK。
+用文本编辑器打开项目根目录下的 `.env`，修改以下字段。示例中的模型 ID 和密钥需要替换为你自己的值：
 
 ```dotenv
-TAVILY_API_KEY=填写自己的Key
-TAVILY_TIMEOUT=30
+AGENT_PROVIDER=deepseek
+MODEL_ID=填写账号支持的模型ID
+ANTHROPIC_API_KEY=填写模型服务的APIKey
+
+TAVILY_API_KEY=填写Tavily的APIKey
+
+AGENT_MEMORY_ENABLED=true
+EMAIL_ENABLED=false
 ```
 
-`search_news(query, time_range="day", domains=[], limit=10)` 固定向 `https://api.tavily.com/search` 发 POST 请求，使用 Bearer 认证、`topic="news"`、`search_depth="basic"`。`time_range` 支持 day/week/month/year，数量为 1..20；domains 最多 20 项，仅填写域名，例如 `example.com`，不填协议与路径。不限制域名时不发送 include_domains。关闭服务生成的 answer 和搜索时的全文获取，保留原始来源片段，由自己的 Agent 负责总结。新闻搜索主要面向新闻报道，并不保证覆盖全部官方博客或论文。
+当前支持 `deepseek` 和 `anthropic` 两种真实模型配置，使用 Anthropic Messages 兼容接口：
 
-启用 `include_published_date` 和 `filter_by_published_date`：按服务估计的发布或更新时间筛选，无法识别日期的来源会被排除。day 是服务向前的一天窗口，不等于 Asia/Shanghai 的自然日；日期可能是更新日期，生成“今日新闻”时应核对原文。没有结果是一次成功的空查询，不证明没有相关事件，可由 Agent 改关键词或时间范围。
+- `deepseek` 默认使用 `https://api.deepseek.com/anthropic`，通常不需要填写 `ANTHROPIC_BASE_URL`。
+- 使用 Anthropic 时，将 `AGENT_PROVIDER` 改为 `anthropic`，填写对应的模型 ID 和 API Key；需要自定义端点时设置 `ANTHROPIC_BASE_URL`。
+- 两种配置都通过 `ANTHROPIC_API_KEY` 读取模型密钥。Tavily 使用独立的 `TAVILY_API_KEY`。
 
-输出 results 中的每项包含 `title`、`url`、`source`（域名）、`published_date`、`score`、`snippet` 和 `snippet_truncated`。工具只去除重复 URL（移除 fragment 后比较），不做语义上的同事件聚类，也不自行计算用户相关性。Agent 使用注入的长期身份/偏好拟定查询词，再判断相关性和同事件重复报道。顶层有 `retrieved_at`（UTC）、`returned_count`、`duplicates_removed`、`skipped_results`、`results_omitted`、`truncated` 和可选值 `credits_used`（未返回时 null）。
+`.env.example` 默认使用 `mock`，适合离线验证工具执行；生成真实新闻简报需要切换到真实模型并配置 Tavily。
 
-`fetch_article(url, max_chars=12000, extract_depth="basic")` 向固定 `/extract` API 发送单 URL，指定 Markdown 格式；不传 query，避免返回按关键词重排的少数片段。深度可选 basic/advanced，后者通常用于普通提取失败后的尝试，费用更高。只接受 HTTP(S) 公开地址，拒绝带凭据的 URL、已知内网 IP、本地主机名和非 80/443 端口；URL 通过 Tavily 服务提取，宿主不会直接抓取目标网页。域名校验不验证 DNS、网页重定向或第三方提取服务的网络边界。
-
-输出有 `url`、`source`、`content`、`format`、`extract_depth`、`original_chars`、`returned_chars`、`truncated`、`retrieved_at`、`credits_used`。正文可能被服务省略或提取失败；`truncated=false` 只表示本工具没有继续截短服务返回的正文，不保证它覆盖原网页全部内容。max_chars 范围 1..20000；最终序列化 JSON 也受 `AGENT_MAX_TOOL_OUTPUT` 约束。搜索先缩短片段，再省略尾部结果；正文通过二分搜索缩短文本，保持完整 JSON。极小输出预算返回 `OUTPUT_LIMIT`。
-
-工具总是注册在默认 Runtime 中，沿用参数校验、PreToolUse/PostToolUse 和 tool_result 回送；传入自定义 ToolRegistry 时仍由调用者选择工具。两者标记 read_only 和 retry_safe，因为不写本地文件，但真实 API 调用会消耗 Tavily 额度。HTTP 响应最多读取 5 MB；请求函数只执行一次，Runtime 的恢复层对已标记的临时故障有限重试。默认首次调用后最多重试两次，设置 `AGENT_MAX_TOOL_RETRIES=0` 可关闭。每次 socket 超时分别受 TAVILY_TIMEOUT 控制，多次尝试的总时间可能更长。不跟随 API 重定向，防止转发认证头；错误不回显原始异常或服务响应正文。401/403 为 AUTH_ERROR，429 为 RATE_LIMITED，432/433 为 QUOTA_EXCEEDED；认证/额度错误不自动重试。短暂连接故障、408/425/429/500/502/503/504 可重试，证书错误及无法明确识别为临时故障的网络错误保守返回。Retry-After 支持秒数和 HTTP 日期；超过 30 秒等待上限时直接返回错误，不提前重试。
-
-```python
-from agent import Runtime
-
-# create() 自动读取启动目录 .env。显式传入 Settings 时，应自己提供配置字段。
-with Runtime.create() as runtime:
-    news = runtime.call_tool("search_news", query="open source AI model release", time_range="week", limit=5)
-    print(news.content)
-    # 用搜索返回的真实链接调用正文工具：
-    # article = runtime.call_tool("fetch_article", url="...", max_chars=12000)
-    # print(article.content)
-```
-
-直接 call_tool 不需要主模型理解任务，所以配置 Tavily Key 后 mock 模式也能调用真实新闻 API。要让 Agent 自主搜索、阅读并生成简报，需要同时配置真实模型 provider、MODEL_ID 和模型 Key，然后运行：
+### 3. 构建前端并启动
 
 ```powershell
-.\.venv\Scripts\python.exe -m agent "根据我的身份和偏好，整理近期 AI 新闻，并附来源链接" --verbose
+cd frontend
+npm.cmd ci
+npm.cmd run build
+cd ..
+
+.\.venv\Scripts\python.exe -m backend
 ```
 
-提示词要求模型把新闻内容当作外部资料，不执行网页中的指令；区分搜索片段和正文、核对日期并给出来源。程序不强制固定“搜一次、读一次”的流程，也没有实现简报自动保存。
+打开：
 
-官方参考：[Search](https://docs.tavily.com/documentation/api-reference/endpoint/search)、[Extract](https://docs.tavily.com/documentation/api-reference/endpoint/extract)、[额度与计费](https://docs.tavily.com/documentation/api-credits)。离线测试替换 HTTP 传输层，不消耗 API 额度；真实联调需有效凭据和可达网络。
+- 浏览器界面：<http://127.0.0.1:8000>
+- API 文档：<http://127.0.0.1:8000/docs>
 
-## Runtime 与 Hooks
+首次使用，在「订阅设置」中填写身份和新闻偏好并保存，例如：
 
-```python
-from pathlib import Path
-from agent import Runtime, Settings
-from agent.events import PRE_TOOL_USE, POST_TOOL_USE
+> 身份：市场营销从业者，关注消费行业。
+>
+> 偏好：消费、零售和品牌新闻；中文，每天 5 条，附来源链接和简短解读。
 
-with Runtime.create(Settings(workdir=Path("D:/NewsAgent"))) as runtime:
-    @runtime.hooks.on(PRE_TOOL_USE)
-    def guard(block, ctx):
-        if block["name"] == "bash":
-            return "本会话仅允许文件工具"  # 非 None 即否决
+然后回到「我的简报」，点击生成。生成完成后，可以阅读正文、下载 Markdown，并在「历史简报」中查看归档。
 
-    @runtime.hooks.on(POST_TOOL_USE)
-    def observe(block, result, ctx):
-        print(block["name"], result.ok)
-
-    result = runtime.call_tool("write_file", path=".agent/example.txt", content="hello AI\n")
-    print(result.ok, result.content)
-```
-
-| Hook | 回调签名 | 返回值 |
-| --- | --- | --- |
-| `SessionStart` | `(ctx)` | 观察；首次 submit / call_tool 前触发 |
-| `UserPromptSubmit` | `(prompt, ctx)` | `None` 放行；其他值拦截 |
-| `PreToolUse` | `(block, ctx)` | `None` 放行；其他值拦截 |
-| `PostToolUse` | `(block, result, ctx)` | 观察；对校验失败、拦截与实际执行均触发 |
-| `Stop` | `(loop_result, ctx)` | `None` 结束；或返回 `StopDirective` |
-| `SessionEnd` | `(ctx)` | close 时触发一次 |
-
-Stop hook 返回 `StopDirective("continue", "请再检查文件内容")` 可以继续模型循环，仍受总轮数限制；返回 `StopDirective("return", "被策略阻止", "blocked")` 可自定义结束状态。
-
-PreToolUse hook 异常会阻止执行。PostToolUse 异常保留实际工具结果、继续通知其他观察者，并记录在 `runtime.ctx.extra["hook_errors"]`。
-
-`runtime.messages` 在内存中保存会话，`runtime.stats` 汇总用户请求的模型轮数、工具调用次数和实际执行次数，不包含额外的记忆模型调用。各 runtime 的 hooks 与对话状态相互独立；同一实例采用同步调用并阻止请求重入。同一工作区的 Runtime 会读取相同的持久记忆与简报目录，当前面向单用户使用。定时调度由 `backend` 提供；目前未加入完整对话记录落盘和上下文压缩。
-
-## 简报保存与历史
-
-使用明确的简报入口生成并归档，普通 `submit()` / 普通聊天不自动保存。归档发生在现有 Agent loop 返回最终文本之后，搜索、文章选择和工具调用仍由模型决定；没有增加固定新闻工作流或额外的归档模型调用。
+前端构建完成后，日常只需在项目根目录运行：
 
 ```powershell
-# 配置真实模型与 Tavily Key；先建立身份和偏好
+.\.venv\Scripts\python.exe -m backend
+```
+
+终端按 `Ctrl+C` 停止服务。修改 `.env` 后需要重启后端；修改前端代码后需要重新构建。
+
+### macOS / Linux
+
+克隆仓库后，后端安装和配置命令改为：
+
+```bash
+cd NewsAgent
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+cp .env.example .env
+```
+
+按上面的说明编辑 `.env`，再构建和启动：
+
+```bash
+cd frontend
+npm ci
+npm run build
+cd ..
+.venv/bin/python -m backend
+```
+
+## 每日订阅和邮件
+
+### 设置每日时间
+
+在「订阅设置」中选择北京时间的生成时间，开启订阅并保存。修改时间后会更新调度，无需重启后端。
+
+定时任务由后端进程执行，需要保持电脑开机、处于唤醒状态，并保持后端运行。CLI 不启动定时任务。
+
+当前同一天定时生成最多尝试一次；当天已经尝试过后，修改时间不会再生成一次。生成失败可以使用手动生成入口重试。后端启动时会检查当天订阅时间，在到期后一小时内尝试补跑；历史中已存在当天非跳过的定时记录时仍会跳过。
+
+### 启用 QQ 邮箱推送
+
+在 QQ 邮箱中开启 SMTP 服务，获取邮箱授权码，然后修改 `.env`：
+
+```dotenv
+EMAIL_ENABLED=true
+SMTP_HOST=smtp.qq.com
+SMTP_PORT=465
+SMTP_USERNAME=你的QQ邮箱@qq.com
+SMTP_PASSWORD=你的邮箱授权码
+# 可选；不填写时发送到 SMTP_USERNAME。
+EMAIL_TO=收件邮箱@example.com
+```
+
+重启后端。定时简报成功归档后会自动发送；手动生成的简报需要在任务记录中点击发送邮件。邮件失败时可以重发已有简报，不需要重新调用模型生成正文。
+
+`SMTP_PASSWORD` 填写邮箱授权码，不是邮箱登录密码。前端只显示配置状态，不填写或保存密钥。
+
+## 命令行使用
+
+在项目根目录运行。以下为 Windows 命令，macOS / Linux 将 Python 路径替换为 `.venv/bin/python`。
+
+```powershell
+# 离线验证：执行五个基础工具，无需模型和 Tavily API Key。
+.\.venv\Scripts\python.exe -m agent --demo --verbose
+
+# 建立或修改身份、新闻偏好。
 .\.venv\Scripts\python.exe -m agent --setup-profile
-# 按长期偏好生成今日简报，完成后自动保存
-.\.venv\Scripts\python.exe -m agent --brief
-# 自定义本次请求和归档标题
-.\.venv\Scripts\python.exe -m agent "生成今天的开源模型新闻简报" --brief --brief-title "开源模型日报"
-# 查看最近 20 份历史，读取指定编号
+
+# 按长期偏好生成并保存今日简报。
+.\.venv\Scripts\python.exe -m agent --brief --verbose
+
+# 指定本次主题和归档标题。
+.\.venv\Scripts\python.exe -m agent "整理近期体育新闻，附来源链接" --brief --brief-title "体育简报"
+
+# 查看历史，使用列表返回的 ID 读取简报。
 .\.venv\Scripts\python.exe -m agent --list-briefs
-.\.venv\Scripts\python.exe -m agent --read-brief "替换为历史列表中的ID"
-# CLI 的结构化生成与归档结果
-.\.venv\Scripts\python.exe -m agent --brief --json
+.\.venv\Scripts\python.exe -m agent --read-brief 简报ID
+
+# 进入交互模式。
+.\.venv\Scripts\python.exe -m agent
 ```
 
-交互模式：`/brief` 生成并保存；`/brief 关注开源模型，选五条` 指定本次请求；`/briefs` 列出历史；`/read-brief ID` 查看正文。`/reset` 清空对话，保留磁盘简报和长期记忆。
+交互命令：`/brief` 生成并保存，`/briefs` 查看历史，`/read-brief ID` 读取正文，`/profile` 查看资料，`/profile edit` 修改资料，`/memory` 查看记忆索引，`/reset` 清空当前对话，`/exit` 退出。
 
-默认目录为工作区内的 `.agent/briefs/`，按北京时间（Asia/Shanghai，UTC+08:00）命名；编号末尾加入随机后缀，同一秒生成多份也不覆盖。相同日期的多次生成分别保留。
+离线 demo 会写入并覆盖 `.agent/demo/news.txt`。默认 mock 不能生成真实简报。普通请求不自动归档，`--brief`、`/brief` 和后端简报入口会生成后保存。
+
+## 工具与执行流程
+
+| 工具 | 用途 |
+| --- | --- |
+| `list_dir(path)` | 列出目录内容 |
+| `read_file(path)` | 读取 UTF-8 文件 |
+| `search_content(keyword, dir)` | 在目录下搜索文件内容 |
+| `write_file(path, content)` | 写入文件 |
+| `bash(command)` | 执行 shell 命令 |
+| `search_news(query)` | 搜索近期新闻 |
+| `fetch_article(url)` | 提取文章正文 |
+
+Runtime 组装配置、模型、工具和记忆。Agent Loop 将工具定义交给模型，执行模型选择的工具，再把结果回送模型，直到产生最终回答。
+
+安全只读工具的临时故障支持有限的程序重试；模型修正工具参数有独立预算。文件写入和 shell 命令不自动重试。空响应和 `max_tokens` 截断会触发有限恢复，仍受总轮数限制。
+
+文件工具只允许访问工作区内的路径；`bash` 使用宿主权限，可通过 `.env` 中的 `AGENT_ALLOW_BASH=false` 禁用。
+
+## 本地数据与配置
+
+默认数据保存在启动目录下的 `.agent/`：
 
 ```text
-.agent/briefs/
-  2026-10-10_080000_a1b2c3d4.md
-  2026-10-10_080000_e5f6a7b8.md
+.agent/
+  memory/
+    MEMORY.md             记忆索引
+    user-profile.md       身份和背景
+    news-preferences.md   长期新闻偏好
+    ...                   其他长期记忆
+  briefs/                 Markdown 简报和元信息
+  backend.sqlite3         订阅设置、任务和邮件状态
 ```
 
-每个文件在 YAML frontmatter 中保存编号、标题、生成时间、时区、模型/provider、模型轮数、工具调用次数、实际执行次数和正文 UTF-8 字节数，后面是最终回复的完整 Markdown 正文。标题优先使用显式标题，否则取正文的首个 Markdown 标题，最后回退为日期标题。归档不保存 API Key、完整对话或用户资料副本；正文中的来源链接保留原样。
+无需另外安装数据库。备份或迁移时，停止后端后复制 `.agent/`；换机器时重新安装依赖，并自行配置 `.env`。
 
-正文和元信息先写入同目录临时文件并 fsync，再以不可覆盖的方式一次发布；没有单独的索引文件或元信息侧文件。失败、拒绝、轮数耗尽、不完整响应和空白文本不归档。保存失败时保留生成文本与 `save_error`，不会重新调用模型，CLI 返回非零退出码。默认未设置脚本的 mock 只返回框架状态，简报入口会提示配置真实模型，不把状态提示当作新闻保存。
+身份和新闻偏好始终加载，其他记忆按请求选择并在工具循环中复用。自动记忆提取默认开启：请求成功结束后检查用户明确表达的长期信息，通过校验后保存。仅本次任务的要求不应覆盖长期偏好。设置 `AGENT_MEMORY_AUTO_EXTRACT=false` 可关闭自动提取，保留手动编辑和记忆加载。
 
-开启记忆且资料缺失时，需要先设置身份和偏好；交互引导可以 `/skip`，或使用 `--no-memory` 生成通用简报，避免把询问用户资料的回复归档。保存条件检查的是 Agent 正常结束且有非空文本，仍应检查实际新闻质量；它不等于所有工具成功或报道已经核实。
+配置优先级为：显式参数 > 进程环境变量 > `.env` > 默认值。默认读取启动目录下的 `.env`，工作区默认也是启动目录；可用 `--env-file` 和 `--workdir` 指定。
 
-`--brief --json` 输出 `{ "result": <LoopResult>, "brief": <元信息或null>, "save_error": "..." }`；普通 `--json` 仍输出原有 LoopResult。历史 JSON 列表只含元信息，单份读取包含 `content`。读取历史直接访问本地归档，不创建模型客户端，不询问资料。
+`.env` 和 `.agent/` 已加入 Git 忽略规则，密钥、身份偏好和私人简报无需提交到仓库。完整配置项见 [.env.example](.env.example)。
 
-目录可用 `AGENT_BRIEFS_DIR`、`--briefs-dir` 或 `Settings(briefs_dir=...)` 配置，优先级仍是显式参数 > 进程环境变量 > .env > 默认值；必须位于工作区子目录，不能与记忆目录重叠。默认 `.agent/` 已在 `.gitignore` 中；使用其他目录时请加入忽略规则。正文上限沿用 `AGENT_MAX_FILE_BYTES`（默认 2 MB），超限报错，不悄悄截断归档。历史列表只读有界文件头，保留有限条元信息，不加载全部简报正文；损坏的文件头会跳过，单份读取会检查正文长度。当前没有删除与全文搜索；CLI 不启动定时器，定时生成使用 `python -m backend`。
+## 常见问题
 
-```python
-from pathlib import Path
-from agent import Runtime, load_settings
+| 现象 | 检查方式 |
+| --- | --- |
+| 打开页面提示前端尚未构建 | 在 `frontend` 中运行 `npm.cmd ci` 和 `npm.cmd run build` |
+| 无法生成真实简报 | 检查是否仍使用 `mock`，以及模型 ID、模型 Key 和 Tavily Key 是否正确 |
+| 新闻工具返回 `MISSING_API_KEY` | 在 `.env` 中填写 `TAVILY_API_KEY`，重启后端 |
+| 配置修改后没有生效 | 重启后端，并检查进程环境变量是否覆盖 `.env` |
+| 到订阅时间没有生成 | 检查后端是否运行、电脑是否休眠、订阅是否启用、当天是否已有定时记录；手动任务占用工作线程也可能导致定时任务被跳过 |
+| 简报生成了但没有邮件 | 检查邮件是否启用、配置是否就绪、是否使用邮箱授权码，以及任务的独立邮件状态 |
+| 8000 端口已占用 | 使用 `.\.venv\Scripts\python.exe -m backend --port 8001`，访问对应端口 |
 
-settings = load_settings(workdir=Path("D:/NewsAgent"))
-with Runtime.create(settings) as runtime:
-    generated = runtime.generate_brief("请按我的长期偏好生成今日简报")
-    if generated.ok:
-        print(generated.brief["path"])
-    else:
-        print(generated.result.error or generated.save_error)
-
-    page = runtime.briefs.list(limit=20)
-    if page:
-        print(runtime.briefs.get(page[0]["id"])["content"])
-        next_page = runtime.briefs.list(limit=20, before=page[-1]["id"])
-```
-
-`BriefStore.save(content, title=...)` 也可直接归档已确认的 Markdown 正文。`runtime.generate_brief()` 返回 `BriefResult`，只有生成正常结束且归档成功时 `ok` 才为真；生成结果保存在 `result`，归档元信息保存在 `brief`。
-
-## 工具失败恢复
-
-从 HarnessAgent 适配 ToolRecovery，保留两层独立预算。程序重试要求 `read_only=True`、`retry_safe=True`、失败标记 `transient=True`，同时排除权限、认证、参数等永久错误。默认首次执行后最多重试两次，每次重新经过 PreToolUse，PostToolUse 观察每次尝试。文件写入与 bash 不自动重试。只读标记与 retry_safe 是宿主元数据，不是模型可传参数。list_dir/read_file/search_content 和两个新闻工具明确允许安全重试，其他自定义工具默认不允许。
-
-模型修正计数只观察一次工具调用的最终结果，首次失败后默认最多两次修正机会：同一工具/目标累计三次指定错误后，第四次被 `RECOVERY_EXHAUSTED` 拦截。成功清零。保留原来的 INVALID_ARGUMENT/UNKNOWN_TOOL/NOT_FOUND/PRECONDITION_FAILED，并为新闻加入 INVALID_REQUEST/EXTRACTION_FAILED/EMPTY_CONTENT。网络超时、认证、限流不计入模型修正集合；它们不受这个三次规则拦截，整个请求仍受 max_turns 限制。目前没有全局 API 熔断或跨请求失败禁用。
-
-search_news 按归一化 query、time_range、排序去重的 domains 区分目标，忽略 limit；fetch_article 按归一化 URL 区分，忽略 max_chars 和 extract_depth。URL 统一域名大小写、移除 fragment 与默认端口，保留路径大小写和查询参数。文件目标采用实际绝对路径及 Windows 大小写归一化。每次 submit 新建恢复对象；连续 call_tool 使用 Runtime 当前恢复对象，直到下一次 submit 或 reset。写入状态保护也仅存在于该恢复作用域，不跨请求/进程持久化。
-
-write_file 失败且 execution_status=unknown 时标记目标，后续写入返回 STATE_CHECK_REQUIRED。完整且未截断的 read_file 或确认文件不存在可解除标记；部分读取、超长文件、工具输出截断均不能作为完整检查证据。这里只保护识别到的 write_file/edit_file 目标，不是限制任意 shell 操作的沙箱。
-
-错误结果增加 field、transient、next_action、execution_status、attempts、repair_failures、retry_after 和 recovery_hint。程序中间重试不会添加额外的模型消息，最终结果仍只对应原来的 tool_use_id。ToolResult.success 的 content 保持原有形式。attempts 是本次调用执行次数，修正预算拦截时为 0；日志单独记录 validation/permission/recovery/execution 阶段。
-
-`runtime.recovery.events`（同 `ctx.extra["tool_attempts"]`）最多保留最近 200 条简短记录，参数只保存 SHA-256，不保存正文；省略数查看 `runtime.recovery.dropped_events`。`runtime.recovery.executions` 保留完整执行总计，日志裁剪不影响预算和统计。verbose 显示 `[retry]` 与 `[recovery]`，不输出原始参数。
-
-```dotenv
-AGENT_MAX_TOOL_RETRIES=2
-AGENT_MAX_TOOL_REPAIRS=2
-```
-
-retries 范围 0..5，0 关闭程序重试；repairs 范围 0..10，0 表示首次可修正失败后不再给修正机会。配置仍按显式参数 > 进程环境变量 > .env > 默认值。逐函数解释和执行例子见 [工具恢复代码说明](docs/tool-recovery.md)。
-
-## 长期记忆
-
-实现复用自 `D:\HarnessAgent\agent\memory.py`，保留 Markdown 文件、索引、相关记忆选择、对话提取与整理机制。只复用代码，NewsAgent 的记忆保存在自己的工作区。
-
-首次在交互终端启动时会询问职业/角色/背景，以及新闻关注主题、来源、语言、深度和长度。直接保存用户输入，不依赖模型生成，因此 mock 模式也可以建立资料。输入 `/skip` 可跳过本次设置，空白会重新询问。
+## 项目结构与开发
 
 ```text
-.agent/memory/
-  MEMORY.md             生成的记忆索引
-  user-profile.md       身份与背景（固定加载）
-  news-preferences.md    新闻订阅偏好（固定加载）
-  <其他记忆>.md          相关时召回的稳定信息
+agent/       Runtime、Agent Loop、模型客户端、工具、记忆、CLI
+backend/     FastAPI 接口、后台任务、定时调度、SQLite 状态、邮件发送
+frontend/    React + TypeScript + Vite 浏览器界面
+tests/       工具、记忆、简报、后端与失败恢复测试
+docs/        接口说明和代码说明
 ```
 
-资料完整后，下次启动不重复询问；只缺一项时仅补问该项。已跳过的当前会话不会被提示反复询问。首次引导只在普通交互终端运行，`--json`、非交互请求与 `--demo` 不调用 input；demo 关闭记忆，不创建用户资料。
+前端开发时，先启动后端，再在另一个终端运行：
 
 ```powershell
-# 只建立或修改资料，完成后退出
-.\.venv\Scripts\python.exe -m agent --setup-profile
-# 保留资料加载与手动编辑，关闭对话结束后的自动提取
-.\.venv\Scripts\python.exe -m agent --no-auto-memory
-# 完全关闭记忆和引导
-.\.venv\Scripts\python.exe -m agent --no-memory
+cd frontend
+npm.cmd run dev
 ```
 
-交互命令：`/profile` 查看身份与偏好；`/profile edit` 修改，已有字段留空时保留；`/memory` 查看记忆索引；`/reset` 清空当前对话，保留磁盘记忆。
+访问 <http://127.0.0.1:5173>，开发服务器将 `/api` 代理到本机 8000 端口。后端使用其他端口时，修改 `frontend/vite.config.ts` 中的代理地址。
 
-Runtime 持有 `memory`，并使用 `build_system()` 组装基础提示词、固定身份/偏好和按请求选择的其他记忆。普通记忆每次用户请求只选择一次，工具循环复用缓存；下一次请求重新选择。核心资料不依赖模型选择，始终加载。
+更多说明：
 
-Stop hook 标记提取意图，Runtime 在请求实际以 `final` 结束后提取一次，避免 Stop 续跑时重复提取；失败、拒绝、轮数耗尽时不自动保存。提取只检查本次请求的对话，要求模型提供用户原文证据，并仅接收 `persistent` 信息。助手推测、工具结果与当前任务状态不作为长期事实。
+- [前端使用与开发](docs/frontend.md)
+- [后端接口与调度规则](docs/backend.md)
+- [QQ 邮箱配置与发送状态](docs/email.md)
+- [工具失败恢复](docs/tool-recovery.md)
+- [Service 代码说明](docs/service-code-guide.md)
 
-用户明确变更身份或长期偏好时，更新对应固定记录，并要求模型保留未更改的内容。`今天只看…`、`这次…` 等临时要求不会覆盖长期资料。核心记录不参与自动整理，不会被记忆合并和裁剪。一般记忆达到 10 条时整理，核心两条不计入阈值。
-
-每个 Markdown 文件采用临时文件加原子替换；整理失败时尝试恢复原始一般记忆。模型错误或不完整的记忆响应不会使正常对话失败，使用 `--verbose` 查看诊断，`/profile` 检查实际保存内容。
-
-默认 mock 不理解任意自然语言，也不自动提取新记忆：它能保存/加载手动资料，并对一般记忆用关键词作召回后备。真实模型用于自动提取和偏好更正；离线测试通过独立 `memory_llm` 脚本验证这些行为，不消耗主 Agent 的 mock 脚本。
-
-配置：`AGENT_MEMORY_ENABLED=true`，`AGENT_MEMORY_AUTO_EXTRACT=true`，`AGENT_MEMORY_DIR=.agent/memory`（默认，路径必须在工作区子目录）。默认目录已由 `.gitignore` 排除；使用其他目录时，应将该目录加入忽略规则。
-
-```python
-with Runtime.create(Settings(workdir=Path("D:/NewsAgent"))) as runtime:
-    runtime.update_profile(identity="AI 产品经理", preferences="开源与应用，中文，每天五条")
-    print(runtime.memory.profile())
-    result = runtime.submit("请按我的偏好处理这次任务")
-```
-
-## 扩展工具
-
-```python
-from agent.tools import Tool, ToolResult
-
-runtime.tools.register(Tool(
-    name="ping",
-    description="Return pong",
-    input_schema={"type": "object", "additionalProperties": False},
-    handler=lambda args, ctx: ToolResult.success("pong"),
-    read_only=True,
-))
-```
-
-测试覆盖工具闭环、中文读写、覆盖保护、参数错误、工作区越界、搜索边界、hook 拦截/异常、停止续跑、轮数耗尽、响应截断、模型失败、会话隔离、shell 错误/超时/截断及配置优先级。链接测试在宿主不允许创建 symlink 时自动跳过。
+当前面向本地单用户，使用单个后端进程和工作线程。许可证见 [LICENSE](LICENSE)。
